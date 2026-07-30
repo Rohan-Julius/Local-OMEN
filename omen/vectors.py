@@ -9,7 +9,15 @@ index, rebuilt from it via `reindex()`.
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
+
+# Belt and braces (PLAN.md): Settings(anonymized_telemetry=False) below is
+# the primary switch, but Chroma also reads this env var directly in a few
+# telemetry code paths — set both so a stray Settings omission can't
+# silently reintroduce a network call. Must be set before chromadb's own
+# telemetry module is imported, so this sits above the `import chromadb`.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 import chromadb
 from chromadb.config import Settings
