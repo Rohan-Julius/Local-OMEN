@@ -105,6 +105,7 @@ class ToolCallStep(BaseModel):
     args: dict = Field(default_factory=dict)
     result: str
     note: str | None = None  # e.g. a duplicate-call or cap notice from ToolBudget
+    ms: int | None = None  # wall-clock time for this call, for the tool_calls audit trail
 
 
 class Transcript(BaseModel):

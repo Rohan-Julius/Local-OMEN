@@ -17,17 +17,30 @@ The working directory on disk is still `Local-lore` (unrenamed — renaming an
 open project directory has its own risk and wasn't part of the code/docs
 rename).
 
-**Current state:** Phases 0-7 done (env verified; contracts/store/vectors;
-Scout; Librarian + `--retrieval-only`; fixtures/calibration GO/NO-GO passed;
-tools.py + ToolBudget; Triage + Investigator + Adjudicator, all via both
-ADKRoleRunner and DirectOllamaRunner, wired into `omen scan`'s real
-pipeline — see README.md for details and acceptance results per phase).
-`archivist.py`, `sifter.py`, and `report.py` (Phase 8 on) are still
-empty/unbuilt — don't assume those do something without checking. `omen scan`
-currently runs Scout -> Librarian -> Triage -> Investigator -> Adjudicator
-and prints a final confirmed/unverified/rejected verdict with mechanism,
-reasoning, confidence, and evidence lines; there is no Scribe yet, so it
-doesn't persist findings to SQLite or render a markdown report.
+**Current state:** All of PLAN.md's "Project plan — 8 hours" phases
+(0 through 9) are built. `omen scan` runs Scout -> Librarian -> Triage ->
+Investigator -> Adjudicator end to end and persists every run to SQLite
+(`runs`, `findings`, `tool_calls` — see `report.py` for the timing/summary
+half and `store.py` for the persistence calls, wired in from `cli.py`).
+`omen learn <postmortem.md>` and `omen learn --from-git <range>` both read
+their input, check memory for a near-duplicate, and write/update an
+incident (`learned_by='archivist:postmortem'` or `'archivist:git'`); the
+git path runs a deterministic `sifter.py` prefilter (message patterns,
+revert detection, sensitive-path signals — no LLM) ahead of the Archivist,
+and takes `--repo` (which repo's history to read — default: the current
+directory), `--max-commits`, `--max-learn`, and `--dry-run`.
+`demo_repo/` is a small, self-contained example service with its own
+nested git repo (ignored by this repo's `.gitignore` at `demo_repo/.git/`
+only, so its *files* are tracked normally) — a planted true positive
+(`permissions.py`, matches the seeded `OMEN-001`), a hard negative
+(`cache/response_cache.py`), a few ordinary files, and a small constructed
+commit history (one real fix commit plus keyword-avoiding decoys) for
+trying `--from-git` end to end. Markdown report rendering (mentioned in
+PLAN.md's cut list as deferred) is still not built — `report.py` only
+does terminal output plus the SQLite writes. README.md no longer keeps a
+phase-by-phase build log (it was rewritten into a plain product README);
+this file and `tests/` are the source of truth for what's actually
+implemented and verified.
 
 ## Environment
 

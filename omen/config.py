@@ -31,6 +31,7 @@ TEMPERATURE = 0
 # richer live reasoning trace, at the accepted latency cost.
 THINK_DEFAULT = False
 INVESTIGATOR_THINK_DEFAULT = True
+ARCHIVIST_THINK_DEFAULT = True
 
 STORE_DIR = Path("omen_store")
 DB_PATH = STORE_DIR / "omen.db"
@@ -58,3 +59,11 @@ MAX_TOOL_CALLS = 6
 TOOL_WALL_CLOCK_SECONDS = 90
 GREP_MAX_HITS = 50
 DIFF_LINE_CAP = 300
+
+# omen learn --from-git (Phase 8b). PLAN.md: "--max-commits (default 50)
+# bounds the prefilter input; --max-learn (default 5) bounds Archivist
+# invocations per run" — a bad memory pollutes every future scan with no
+# obvious undo, so these stay conservative even though `omen memory forget`
+# is the safety valve.
+MAX_COMMITS = 50
+MAX_LEARN = 5

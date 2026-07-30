@@ -11,3 +11,11 @@ omen_store/chroma/
 *.sqlite3
 
 .env
+
+# demo_repo/ is its own git repository (constructed history for `omen learn
+# --from-git`), nested inside this one. Ignoring only its .git/ keeps its
+# *files* tracked normally by the outer repo without turning it into an
+# embedded gitlink/submodule.
+demo_repo/.git/
+
+CLAUDE.md

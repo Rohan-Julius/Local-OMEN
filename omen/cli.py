@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+import time
+import uuid
 from pathlib import Path
 
-from omen import agents, config, fixtures as fixtures_mod, librarian, runners, scout, store, tools as tools_mod, vectors
-from omen.contracts import AdjudicatorVerdict, GatedChunk, RetrievalCandidate, Transcript, TriageVerdict
+from omen import agents, archivist, config, fixtures as fixtures_mod, librarian, report, runners, scout, sifter, store, tools as tools_mod, vectors
+from omen.contracts import AdjudicatorVerdict, Finding, GatedChunk, RetrievalCandidate, RunRecord, ToolCallRecord, Transcript, TriageVerdict
 
 # Windows consoles default to a legacy codepage that mangles em-dashes and
 # other non-ASCII content living in incident/postmortem text (renders as
@@ -53,6 +56,81 @@ def cmd_memory_forget(args: argparse.Namespace) -> None:
         return
     vectors.delete_incident_variants(args.ref)
     print(f"Forgot {args.ref} (removed from ledger and vector index).")
+
+
+def _on_step_printer():
+    def on_step(step) -> None:
+        note = f"  ({step.note})" if step.note else ""
+        print(f"  [tool] {step.tool_name}({step.args}) -> {str(step.result)[:100]!r}{note}")
+
+    return on_step
+
+
+async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> None:
+    print(f"[archivist] reading {args.postmortem_path}...")
+    transcript = await archivist.learn_from_postmortem(
+        runner, conn, Path.cwd(), args.postmortem_path, on_step=_on_step_printer()
+    )
+    print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+    print(f"[archivist] summary: {transcript.final_text}")
+
+    ref = archivist.written_ref(transcript)
+    if ref:
+        print(f"Learned/updated {ref}. Run `omen memory forget {ref}` to undo.")
+    else:
+        print("No incident was written.")
+
+
+async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> None:
+    # Path(args.repo), not Path.cwd(): prompts load from a cwd-relative
+    # "prompts/" (agents.PROMPTS_DIR), so the repo being learned from must
+    # stay a plain argument, exactly like `omen scan <path>` — cwd has to
+    # stay the omen project root for prompt loading to work at all.
+    repo_root = Path(args.repo).resolve()
+    candidates = sifter.select_candidates(repo_root, args.from_git, max_commits=args.max_commits)
+    print(f"[sifter] {args.from_git}: {len(candidates)} candidate(s) out of up to {args.max_commits} commit(s) considered")
+    for c in candidates:
+        print(f"  {c.sha[:8]}  {c.reason:14}  {c.subject}")
+
+    if args.dry_run:
+        print("--dry-run: no commits will be learned")
+        return
+
+    to_learn = candidates[: args.max_learn]
+    if len(candidates) > len(to_learn):
+        print(f"--max-learn {args.max_learn}: only the first {len(to_learn)} candidate(s) will be learned")
+
+    learned: list[str] = []
+    for c in to_learn:
+        print(f"\n[archivist] learning from {c.sha[:8]} ({c.reason}): {c.subject}")
+        transcript = await archivist.learn_from_commit(runner, conn, repo_root, c.sha, on_step=_on_step_printer())
+        print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+        print(f"[archivist] summary: {transcript.final_text}")
+        ref = archivist.written_ref(transcript)
+        if ref:
+            print(f"  -> {ref}")
+            learned.append(ref)
+        else:
+            print("  -> no incident written")
+
+    if learned:
+        print(f"\nLearned/updated {len(learned)} incident(s): {', '.join(learned)}. Run `omen memory forget <ref>` to undo any of them.")
+    else:
+        print("\nNo incidents were written.")
+
+
+async def cmd_learn(args: argparse.Namespace) -> None:
+    if bool(args.postmortem_path) == bool(args.from_git):
+        print("error: pass exactly one of a postmortem path or --from-git <range>")
+        return
+
+    conn = store.connect()
+    runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
+
+    if args.from_git:
+        await _cmd_learn_git(args, conn, runner)
+    else:
+        await _cmd_learn_postmortem(args, conn, runner)
 
 
 def _print_chunk_table(chunks) -> None:
@@ -129,11 +207,22 @@ def _finalize_adjudicator_verdict(verdict: AdjudicatorVerdict) -> AdjudicatorVer
     return verdict
 
 
-async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Path, gated: list[GatedChunk]) -> None:
+async def _triage_and_investigate(
+    args: argparse.Namespace,
+    conn,
+    repo_path: Path,
+    gated: list[GatedChunk],
+    run_id: str,
+    stats: report.ScanStats,
+) -> list[Finding]:
     runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
     triage_instruction = agents.load_prompt("triage.txt")
     investigator_instruction = agents.load_prompt("investigator.txt")
     adjudicator_instruction = agents.load_prompt("adjudicator.txt")
+
+    triage_watch = report.Stopwatch()
+    investigate_watch = report.Stopwatch()
+    findings: list[Finding] = []
 
     for gc in gated:
         c = gc.chunk
@@ -142,7 +231,9 @@ async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Pat
             print(f"  candidate: {cand.incident_ref}  similarity={cand.similarity:.3f}  ({cand.matched_variant})")
 
         triage_prompt = _format_triage_prompt(conn, c, gc.candidates)
-        verdict = await runner.run_structured(triage_instruction, triage_prompt, TriageVerdict, think=config.THINK_DEFAULT)
+        with triage_watch.lap():
+            verdict = await runner.run_structured(triage_instruction, triage_prompt, TriageVerdict, think=config.THINK_DEFAULT)
+        stats.n_triaged += 1
         print(f"  [triage] verdict={verdict.verdict}  confidence={verdict.confidence}")
         print(f"  [triage] mechanism: {verdict.code_mechanism}")
         print(f"  [triage] reasoning: {verdict.reasoning}")
@@ -155,18 +246,37 @@ async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Pat
         budget = tools_mod.ToolBudget()
         investigator_prompt = _format_investigator_prompt(c, verdict, gc.candidates)
 
+        seq = 0
+
         def on_step(step) -> None:
+            nonlocal seq
+            seq += 1
             note = f"  ({step.note})" if step.note else ""
             print(f"    [tool] {step.tool_name}({step.args}) -> {step.result[:100]!r}{note}")
+            store.record_tool_call(
+                conn,
+                ToolCallRecord(
+                    run_id=run_id,
+                    chunk_symbol=c.symbol,
+                    seq=seq,
+                    tool_name=step.tool_name,
+                    args_json=json.dumps(step.args),
+                    result_summary=step.result[:200],
+                    ms=step.ms,
+                ),
+            )
+            stats.n_tool_calls += 1
 
-        transcript = await runner.run_tooled(
-            investigator_instruction,
-            investigator_prompt,
-            scan_tools,
-            budget,
-            think=config.INVESTIGATOR_THINK_DEFAULT,
-            on_step=on_step,
-        )
+        with investigate_watch.lap():
+            transcript = await runner.run_tooled(
+                investigator_instruction,
+                investigator_prompt,
+                scan_tools,
+                budget,
+                think=config.INVESTIGATOR_THINK_DEFAULT,
+                on_step=on_step,
+            )
+        stats.n_investigated += 1
         print(f"  [investigator] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
         print(f"  [investigator] summary: {transcript.final_text}")
 
@@ -185,6 +295,37 @@ async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Pat
         for line in adj_verdict.evidence_lines:
             print(f"  [adjudicator] evidence: {line}")
 
+        if adj_verdict.verdict == "confirmed":
+            stats.n_confirmed += 1
+
+        # AdjudicatorVerdict carries no structured incident_ref of its own
+        # (it rules on the chunk, not on a specific candidate id) — the
+        # candidate list is already similarity-sorted descending
+        # (librarian.collapse_to_incidents), so the top one is the incident
+        # this finding is recorded against.
+        top_candidate = gc.candidates[0]
+        finding = Finding(
+            run_id=run_id,
+            incident_ref=top_candidate.incident_ref,
+            file_path=c.file_path,
+            start_line=c.start_line,
+            end_line=c.end_line,
+            symbol=c.symbol,
+            similarity=top_candidate.similarity,
+            verdict=adj_verdict.verdict,
+            code_mechanism=adj_verdict.code_mechanism,
+            reasoning=adj_verdict.reasoning,
+            evidence="; ".join(adj_verdict.evidence_lines),
+            confidence=adj_verdict.confidence,
+            tool_calls=len(transcript.steps),
+        )
+        store.record_finding(conn, finding)
+        findings.append(finding)
+
+    stats.ms_triage = triage_watch.total_ms
+    stats.ms_investigate = investigate_watch.total_ms
+    return findings
+
 
 async def cmd_scan(args: argparse.Namespace) -> None:
     repo_path = Path(args.path).resolve()
@@ -199,8 +340,11 @@ async def cmd_scan(args: argparse.Namespace) -> None:
         return
 
     conn = store.connect()
-    gated, stats = librarian.run(conn, chunks)
-    print(f"embed cache: {stats.n_cache_hits}/{stats.n_total} hits ({stats.n_cache_misses} miss(es) embedded)")
+
+    embed_watch = report.Stopwatch()
+    with embed_watch.lap():
+        gated, embed_stats = librarian.run(conn, chunks)
+    print(f"embed cache: {embed_stats.n_cache_hits}/{embed_stats.n_total} hits ({embed_stats.n_cache_misses} miss(es) embedded)")
     print(f"{len(gated)}/{len(chunks)} chunk(s) cleared the similarity threshold ({librarian.SIMILARITY_THRESHOLD})")
 
     if args.retrieval_only:
@@ -213,9 +357,37 @@ async def cmd_scan(args: argparse.Namespace) -> None:
                 print(f"    {cand.incident_ref}  {cand.similarity:.3f}  {cand.matched_variant}")
         return
 
-    if not gated:
-        return
-    await _triage_and_investigate(args, conn, repo_path, gated)
+    # --dry-run and --retrieval-only never reach here, so neither shows up
+    # in `runs` — both are explicitly no-generation previews, not scans.
+    run_id = uuid.uuid4().hex[:12]
+    store.start_run(
+        conn,
+        RunRecord(
+            run_id=run_id,
+            mission="scan",
+            repo_path=str(repo_path),
+            scope=scope_result.scope,
+            llm_model=config.LLM_MODEL,
+            embed_model=config.EMBED_MODEL,
+            runner=args.runner,
+        ),
+    )
+    total_start = time.perf_counter()
+    stats = report.ScanStats(
+        n_files=len(scope_result.files),
+        n_chunks=len(chunks),
+        n_cache_hits=embed_stats.n_cache_hits,
+        n_gated=len(gated),
+        ms_embed=embed_watch.total_ms,
+    )
+
+    findings: list[Finding] = []
+    if gated:
+        findings = await _triage_and_investigate(args, conn, repo_path, gated, run_id, stats)
+
+    stats.ms_total = round((time.perf_counter() - total_start) * 1000)
+    store.finish_run(conn, run_id, **stats.as_run_fields())
+    report.print_summary(stats, findings)
 
 
 def cmd_calibrate(args: argparse.Namespace) -> None:
@@ -285,6 +457,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_memory_forget = memory_sub.add_parser("forget", help="Delete an incident by ref")
     p_memory_forget.add_argument("ref")
     p_memory_forget.set_defaults(func=cmd_memory_forget)
+
+    p_learn = sub.add_parser("learn", help="Form a memory from a postmortem document or raw git history")
+    p_learn.add_argument(
+        "postmortem_path",
+        nargs="?",
+        default=None,
+        help="Path to a postmortem document, relative to the current directory",
+    )
+    p_learn.add_argument(
+        "--from-git",
+        metavar="RANGE",
+        default=None,
+        help="Learn from raw git history instead of a postmortem, e.g. HEAD~40..HEAD",
+    )
+    p_learn.add_argument(
+        "--repo",
+        default=".",
+        help="With --from-git, the repo to read history from (default: current directory)",
+    )
+    p_learn.add_argument(
+        "--max-commits",
+        type=int,
+        default=config.MAX_COMMITS,
+        help="Bound on how many commits from --from-git's range the Sifter's prefilter considers",
+    )
+    p_learn.add_argument(
+        "--max-learn",
+        type=int,
+        default=config.MAX_LEARN,
+        help="Bound on how many Sifter candidates the Archivist actually processes",
+    )
+    p_learn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --from-git, print the Sifter's candidates and stop — write nothing",
+    )
+    p_learn.add_argument(
+        "--runner",
+        choices=["adk", "direct"],
+        default="adk",
+        help="adk (default) or direct — the reversibility hedge if ADK's tool path is flaky",
+    )
+    p_learn.set_defaults(func=cmd_learn)
 
     p_scan = sub.add_parser("scan", help="Investigate a codebase against the incident ledger")
     p_scan.add_argument("path", nargs="?", default=".")

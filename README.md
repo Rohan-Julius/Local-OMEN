@@ -1,295 +1,225 @@
 # Omen
 
-An autonomous institutional-memory agent — a scoped-down, fully local rebuild
-of [LORE](https://devpost.com/software/lore-living-organizational-record-engine)
-for the *Agents on a Mission* track. Full design and rationale: [PLAN.md](PLAN.md).
+Omen is a local, agentic system that turns your team's own incident history
+into a standing set of code reviewers. You teach it about past failures —
+either by pointing it at a postmortem or letting it read straight from git
+history — and it remembers the *mechanism* behind each one, not just the
+file or the fix. Point it at a codebase afterward and it flags new code that
+is quietly set up to fail the same way, with cited evidence for why.
 
-Two missions, one local model (Gemma 4 via Ollama), one memory (SQLite + Chroma):
+Two commands, one idea:
 
-- `omen learn <postmortem.md>` / `omen learn --from-git <range>` — form memories
-  from a written postmortem or directly from raw git history.
-- `omen scan <path>` — investigate a codebase against those memories using tools,
-  and explain why new code repeats an old failure.
+- `omen learn <postmortem.md>` / `omen learn --from-git <range>` — turn a
+  written postmortem, or raw commit history, into a durable, technology-
+  agnostic memory of a failure.
+- `omen scan <path>` — check a codebase (or just a diff) against every
+  memory learned so far, and explain — with mechanism, reasoning, and
+  evidence — why a chunk of code repeats one.
 
-## Status
+Everything runs on-device against a local Gemma model served by
+[Ollama](https://ollama.com/); nothing is sent to a third-party API.
 
-Phase 0 complete (2026-07-30), on the RTX 5050 Laptop (8GB VRAM, Blackwell
-sm_120, driver 595.95) — dev and demo are the same machine, so there is no
-separate Mac tier. Python 3.11.9 venv (3.12 unavailable; 3.14 too new for
-some wheels). See PLAN.md → "Project plan — 8 hours" for the build order and
-"Verification" for acceptance checks per phase.
+## Why a local model
 
-### Phase 0 results
+**Privacy.** The whole point of Omen is to read your code — full source
+files, diffs, and the incident postmortems that describe how something went
+wrong internally. That's exactly the kind of material a team can't casually
+ship to a third-party API: proprietary logic, security-sensitive code paths,
+and post-incident writeups that may describe an outage or a vulnerability in
+detail. Running Gemma locally via Ollama means none of it ever leaves the
+machine — there's no API call to a hosted model, no vendor logging, no data
+retention policy to trust.
 
-- **Embedding dimension:** 768 (`embeddinggemma`, one `/api/embed` call).
-- **Structured output (0b):** **10/10** schema-valid over 10 runs on a
-  Triage-shaped prompt → build on ADK, per the plan's decision rule.
-- **Tool calling (0b):** naive stub tools looped 0/10 (see below); with a
-  file-level duplicate-call cache and realistic tool content, **4/4**
-  correct on a smaller validation pass → tool calling itself is reliable,
-  but `tools.py` (Phase 5) MUST implement the duplicate-call cache from the
-  start, not as a later hardening pass — a model that gets an unsatisfying
-  or repeated-looking tool result will re-call it until it hits the hard
-  cap rather than concluding.
-- **VRAM/perf gate (0c):** 12B Q4_K_M runs, but three things the plan didn't
-  anticipate:
-  1. **Ollama defaults to a partial CPU/GPU split** (~30/70) on this card at
-     `num_ctx=8192`, giving only ~5 tok/s. Passing `num_gpu=999` explicitly
-     forces full GPU residency (all 7.8GB on GPU) — do this always.
-     `num_ctx=4096` fits comfortably at full GPU residency; 8192 does not.
-  2. **Gemma 4's default "thinking" mode costs ~8x latency** (56s vs 7s on
-     the same prompt, ~560 vs ~56 tokens) with no verdict-quality
-     difference observed. `think=False` is required for latency-sensitive
-     structured roles (Triage, Adjudicator) to hit the plan's ~8-10s
-     target; the track's "reasoning" requirement is satisfied by the
-     schema's `reasoning` field and the Investigator's tool trace, not by
-     this hidden chain-of-thought.
-  3. **The very first inference call after each Ollama restart can hard-crash**
-     the CUDA backend (`llama-server process has terminated ... CUDA error:
-     shared object initialization failed`), then succeed on immediate retry
-     and stay stable. Reproduced twice. Mitigation: a throwaway warm-up
-     call with one retry-on-connection-error, run at startup and before the
-     demo — not merely the plan's "keep it warm for latency," but load-bearing
-     for correctness.
-- **Decision:** stay on `gemma4:12b-it-q4_K_M` (no E4B fallback needed).
-  `config.py` defaults to `num_gpu=999`, `num_ctx=4096`, and `think=False`
-  for Triage/Adjudicator (Investigator may want `think=True` for a richer
-  live trace, at the accepted latency cost).
-
-### Phase 1 results
-
-`contracts.py`, `store.py` (SQLite schema + CRUD), `vectors.py` (Chroma,
-`embedding_function=None`, telemetry off), and `incidents.yaml` (6 seed
-incidents, 4 surface forms each) are in. A minimal `cli.py` exposes `seed`,
-`reindex`, `memory list`, `memory forget` — the `scan`/`learn` subcommands
-land in later phases.
-
-- `omen memory list` shows all 6 seeded incidents.
-- `omen reindex` produces 30 Chroma entries (6 incidents x 5 variants:
-  1 mechanism + 4 surface forms each); running it twice yields the same
-  count; deleting `omen_store/chroma` entirely and reindexing from SQLite
-  alone reproduces the same 30 — confirms SQLite is genuinely the source
-  of truth and Chroma is a derived index.
-- `omen memory forget <ref>` removes an incident from both SQLite and
-  Chroma (verified: 30 -> 25 on removing one 5-variant incident).
-- **Retrieval sanity check** (ahead of Phase 4's formal calibration): a
-  `functools.lru_cache`-shaped permission check, embedded with the
-  retrieval-document prefix, returns OMEN-001 as all of its top 5 hits
-  against the retrieval-query-prefixed incident variants — the
-  EmbeddingGemma prefix convention (`task: search result | query: ...` for
-  incident variants, `title: none | text: ...` for code) is correct.
-
-### Phase 2 results
-
-`scout.py`: git scope resolution (`diff` default, `--since <rev>`, `--all`,
-non-git fallback with a warning) and `ast` chunking (top-level functions,
-`Class.method` for methods, a whole-class chunk for method-less classes,
-decorators included in the span, oversized functions split at 120 lines
-with a 10-line overlap, module-level statements bundled into one
-`<module>` chunk). Wired into `omen scan <path> --dry-run`.
-
-14/14 tests pass (`tests/test_scout.py`), including the three the plan
-requires (non-git dir, unparseable file, over-long function) plus extra
-coverage on class methods, decorators, and content-hash determinism.
-
-### Phase 3 results
-
-`librarian.py`: hash-cached embedding (batches of 32, `omen/store.py`'s
-`chunk_vectors` table), Chroma query at `n_results=6` on variant level,
-collapse to best-variant-per-incident, cap at top 3, gate by similarity
-(`SIMILARITY_THRESHOLD` in `config.py` — a placeholder until Phase 4's
-fixture sweep). Wired into `omen scan <path> --retrieval-only`, the
-zero-generation demoable artifact the plan wants at this point.
-
-- **Manual end-to-end check**: a `functools.lru_cache`-decorated
-  `has_access` (the planned demo true positive) retrieves OMEN-001 at
-  0.507 similarity; the actual hard-negative function in a parallel
-  `response_cache.py` (`get_static_page`, a real but unrelated cache)
-  does **not** clear the threshold at all — only weaker incidental
-  matches (a helper function, a bare `_cache = {}` declaration) do,
-  which is expected at the retrieval-only gate and exactly what Triage's
-  mechanism-first reasoning (Phase 6) exists to filter further.
-- Cache verified: 0/4 hits on first run, 4/4 hits on an identical rerun.
-- 23/23 tests pass (`tests/test_librarian.py` + `test_scout.py`):
-  `collapse_to_incidents`/`gate` logic tested with no network dependency;
-  the cache is tested with a monkeypatched embedder; one live end-to-end
-  test (skips gracefully if Ollama is unreachable) pins the Phase 3
-  acceptance criterion directly, against an isolated Chroma path so it
-  can never touch the real seeded ledger.
-
-### Phase 4 results — GO/NO-GO gate, PASSED
-
-`fixtures/fixtures.yaml`: 12 labeled chunks (4 true matches, 4 hard
-negatives — each a deliberate near-neighbor of one true match, 4
-unrelated). `omen calibrate` sweeps the similarity floor in 0.05 steps
-and prints where true positives stop surviving and hard negatives start
-getting rejected.
-
-- **First sweep failed the bar**: at the only threshold keeping 4/4 true
-  positives (~0.35, bounded by the weakest true positive at 0.360),
-  **3/4** hard negatives also survived — one over the "at most 2/4"
-  limit. Root cause, exactly as PLAN.md predicts: text embeddings don't
-  reliably encode negation, so a surface form describing what's *absent*
-  ("no exponential backoff") still sits close to code that similarly
-  discusses backoff/retry/connection vocabulary, whether the backoff is
-  present or not.
-- **First fix attempt backfired**: lengthening `OMEN-004`'s surface form
-  to more explicitly describe the absent atomicity actually *raised* its
-  hard negative's score (0.441 -> 0.532), because the added words
-  increased topical overlap with the domain (seat booking) rather than
-  separating the mechanism.
-- **What actually worked**: diversifying the hard negative's domain
-  instead of wordsmithing the incident. `HN4` was rewritten from an
-  atomic seat-booking fix (near-verbatim overlap with one surface form's
-  exact vocabulary) to an atomic inventory-decrement fix — same
-  TOCTOU-safe mechanism, different domain. Its score dropped from 0.532
-  to 0.224, well clear of any threshold.
-- **Final result at `SIMILARITY_THRESHOLD = 0.35`**: **4/4 true positives
-  survive, exactly 2/4 hard negatives survive** — meets the acceptance
-  bar. Margin is real but tight: the floor sits between the strongest
-  rejected hard negative (0.344) and the weakest true positive (0.360),
-  about 0.01 on either side.
-- Pinned as an ongoing regression gate in `tests/test_fixtures.py`
-  (3 tests, skips gracefully without Ollama) — the plan's intent that a
-  prompt or config change that lifts recall while wrecking precision
-  must fail here, not on stage. 26/26 tests pass project-wide.
-
-### Phase 5 results
-
-`tools.py`: the 7 tool functions (`read_code`, `grep_symbol`,
-`search_memory`, `get_incident` for scanning; `read_file`, `read_commit`,
-`read_diff`, `write_incident` for learning — `search_memory` and
-`write_incident` are shared/reused across the learn tool sets) plus
-`ToolBudget`, the orchestrator-side enforcement of the three hard caps:
-max 6 total calls, a duplicate-call cache (a repeat of the same
-tool+args is served from cache with a note instead of re-executing —
-verified the underlying tool genuinely only runs once), and a 90s
-wall-clock ceiling. All three enforced in `ToolBudget.invoke`, never
-left to a prompt.
-
-- Path confinement (`confine()`) rejects both relative traversal
-  (`../../etc/passwd`) and absolute-path escapes for `read_code` and
-  `read_file`; `read_diff` doesn't need it since git resolves paths
-  against its own object database for that commit, not the host
-  filesystem — a traversal attempt there just fails to match a tracked
-  path.
-- Tool sets are built per mission and per input path, never pooled:
-  `build_scan_tools` (4), `build_learn_postmortem_tools` (3),
-  `build_learn_git_tools` (4) — asserted directly in tests.
-- Found and fixed a real Windows-console bug along the way: em-dashes in
-  incident prose (not just in my own print statements this time — the
-  *data* itself) were rendering as `�`. Fixed once, generally, by forcing
-  UTF-8 stdout/stderr in `cli.py`'s entry point rather than hunting every
-  em-dash in content.
-- 25 new tests (51 total project-wide): read_code/read_file traversal
-  rejection, grep_symbol whole-word matching and skip-dir behavior,
-  read_commit/read_diff against a real temp git repo (including
-  truncation at the line cap), write_incident create + auto-increment +
-  update-by-ref against an isolated store, and all three ToolBudget caps
-  plus a live search_memory/get_incident test (skips without Ollama).
-
-### Phase 6 results
-
-`prompts/triage.txt` and `prompts/investigator.txt`; `agents.py` (the
-only module that imports `google.adk`, exposing generic
-`run_structured_adk`/`run_tooled_adk`); `runners.py` (`RoleRunner`
-protocol, `ADKRoleRunner`, and a fully-implemented `DirectOllamaRunner` —
-not hypothetical insurance, both paths are tested equally). Wired into
-`omen scan`'s real pipeline (Triage on every gated chunk, Investigator on
-Triage positives), replacing the "not implemented" placeholder.
-
-- **End-to-end validation was clean on the first real run**: against a
-  planted true positive (`functools.lru_cache` on a permission check) and
-  a hard negative (a bare module-level dict, and a helper function with
-  no cache at all), Triage ruled MATCH/NO_MATCH/NO_MATCH correctly with
-  precise mechanism-first reasoning for all three, and the Investigator's
-  evidence-based summary on the one true positive correctly cited a
-  `grep_symbol("cache_clear")` search returning empty as evidence of no
-  invalidation path.
-- **Fixture set through Triage** (PLAN.md's Phase 6 acceptance item, and
-  also the Verification section's full-pipeline gate — "≥3/4 true
-  positives caught, ≤1/4 hard negatives flagged"): **4/4 true positives
-  caught, 0/4 hard negatives flagged, 0/4 unrelated flagged.** Pinned as
-  `tests/test_triage.py`.
-- **Determinism (temperature 0) needed a real fix, not just a config
-  value.** Passing `temperature=0` as a `LiteLlm` constructor kwarg
-  looked right (num_gpu/num_ctx/think all work that way) but didn't
-  reliably reach Ollama through the ADK -> LiteLLM chain — verdicts
-  varied slightly run to run. Setting it via ADK's own
-  `generate_content_config=GenerateContentConfig(temperature=0)` on the
-  `LlmAgent` fixed it: verdict and confidence are now stable across every
-  repeated run tested (a single one-off full-text divergence was seen
-  once outside that fix, consistent with known GPU floating-point
-  non-associativity under flash attention, not a plumbing issue).
-- **A real bug found and fixed**: the Investigator's returned
-  `final_text` initially included its entire raw chain-of-thought ramble
-  when `think=True`, because ADK's `genai.types.Part` marks thinking text
-  with a `thought: bool` flag that wasn't being checked. Fixed by
-  streaming thinking text live via `on_text` but excluding it from the
-  text returned to the caller — the Adjudicator (Phase 7) needs the
-  clean conclusion, not the scratch work.
-- Tool-call caps, streaming callbacks (`on_step`/`on_text`), and the
-  duplicate-call cache all verified working identically across both
-  runners, including a case where a test's own assertion (not the
-  implementation) was wrong: an adversarial prompt telling the model to
-  retry 3 times after a cap message caused 3 *attempts*, which is
-  correct model behavior — the property that actually matters (only one
-  attempt ever did real work) held throughout.
-- 12 new tests (63 total project-wide) across `tests/test_runners.py`
-  (parametrized across both runners: true-positive/hard-negative
-  structured judging, determinism, a live tooled investigation, and
-  call-cap enforcement) and `tests/test_triage.py` (the fixture
-  precision/recall gate).
-
-### Phase 7 results
-
-`prompts/adjudicator.txt` and the `AdjudicatorVerdict` schema (already
-present in `contracts.py` from Phase 1) wired into `omen scan`'s pipeline
-as the final stage after the Investigator: chunk + candidate incidents +
-investigation transcript in, `confirmed` / `unverified` / `rejected` out.
-No new module — `agents.run_structured_adk` and both `RoleRunner`s were
-already generic over any `output_schema`, so the Adjudicator is a prompt
-file plus a prompt-assembly function and one loop step in `cli.py`, not
-new plumbing.
-
-- **Adjudicator independence is enforced by construction, not convention.**
-  `_format_adjudicator_prompt(conn, chunk, candidates, transcript)` takes
-  no `TriageVerdict` parameter at all — there is nothing to accidentally
-  leak. `tests/test_adjudicator.py::test_adjudicator_prompt_is_blind_to_triage`
-  builds a `TriageVerdict` with a distinctive reasoning string and its
-  literal `"MATCH"` verdict, asserts neither appears in the assembled
-  prompt, and only then checks the transcript/candidate context that
-  *should* be there survived.
-- **Empty `evidence_lines` on a `confirmed` verdict is downgraded to
-  `unverified` in code** (`_finalize_adjudicator_verdict`), never left to
-  the model's discretion — covered by a pure unit test, no model needed.
-- **Fixture precision held, not just "improved or held."** Re-running the
-  Phase 6 true-positive (`functools.lru_cache` permission check) and hard-
-  negative (`cachetools.TTLCache` thumbnail cache) pair all the way through
-  Triage -> Investigator -> Adjudicator: the true positive came back
-  `confirmed` with real `file:line` evidence citations from the
-  Investigator's transcript; the hard negative's Investigator correctly
-  found no authorization check anywhere in the file and the Adjudicator
-  ruled it non-`confirmed` on that evidence. Pinned as
-  `tests/test_adjudicator.py::test_adjudicator_end_to_end`
-  (parametrized, live Ollama, skips gracefully without it).
-- 6 new tests (69 total project-wide) in `tests/test_adjudicator.py`.
-
-`omen scan`'s real pipeline is now Scout -> Librarian -> Triage ->
-Investigator -> Adjudicator end to end, printing a final verdict with
-mechanism, reasoning, confidence, and evidence lines for every
-Triage-positive chunk. Persistence to `findings`/`runs` (the Scribe) is
-still Phase 9 — the pipeline prints its verdict but doesn't yet write it
-to SQLite.
+**Cost.** Omen's scan pipeline can call the model several times per code
+chunk (a fast structured pass, then a multi-step tool-calling investigation,
+then a final adjudication), and a `learn` run adds a further tool-calling
+pass per postmortem or commit. Against a hosted per-token API, iterating on
+prompts or scanning a large codebase repeatedly gets expensive fast. Against
+a local model, once the weights are downloaded, every call is free — so the
+pipeline can afford to be thorough (multiple judging stages, an agentic
+investigation loop) in a way that would be cost-prohibitive to run per-token
+in the cloud.
 
 ## Setup
 
+Prerequisites: Python 3.11, and [Ollama](https://ollama.com/) installed and
+running.
+
 ```
+git clone <this-repo>
+cd Local-lore
+
 py -3.11 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-# models already pulled: ollama list -> embeddinggemma, gemma4:12b-it-q4_K_M
+
+ollama pull gemma4:12b-it-q4_K_M
+ollama pull embeddinggemma
+```
+
+Load the starter incident ledger and build its vector index:
+
+```
 python -m omen.cli seed incidents.yaml
 python -m omen.cli reindex
 python -m omen.cli memory list
 ```
+
+You should see the seeded incidents printed with their refs (`OMEN-001`,
+`OMEN-002`, ...). From here you can teach it a new incident or scan a repo:
+
+```
+python -m omen.cli learn postmortems/some-incident.md
+python -m omen.cli scan path/to/a/repo
+```
+
+`omen scan` defaults to diffing the working tree; pass a directory and
+`--all` to scan every tracked file instead of just what's changed.
+
+### Try it against the bundled example
+
+`demo_repo/` is a small, self-contained example service (its own git repo,
+nested inside this one) with a planted true positive — a
+`functools.lru_cache`'d permission check with no invalidation on revoke,
+sharing OMEN-001's mechanism with no shared vocabulary at all (no Redis, no
+TTL) — and a hard negative: a genuine cache, `cache` in every identifier,
+mechanically unrelated (it caches a static response body, nothing
+authorization-related). It also has its own small commit history, including
+one real fix commit and a handful of decoys, for trying `omen learn
+--from-git` end to end:
+
+```
+python -m omen.cli scan demo_repo --all
+python -m omen.cli learn --from-git HEAD --repo demo_repo --dry-run   # drop --dry-run to actually learn
+```
+
+### GPU notes
+
+If you're running on a GPU-constrained card, model loading matters: Ollama
+can silently split the model across CPU/GPU and tank throughput unless it's
+told to keep the whole model resident on GPU. `omen/config.py` is the one
+place model and runtime flags (`NUM_GPU`, `NUM_CTX`, `THINK_DEFAULT`) live —
+adjust there if you're on different hardware.
+
+## Commands
+
+All commands go through `python -m omen.cli <command>`.
+
+| Command | What it does |
+|---|---|
+| `omen seed <incidents.yaml>` | Loads a YAML file of incidents into the SQLite ledger. Used once to bootstrap a starter memory set. |
+| `omen reindex` | Rebuilds the Chroma vector index from SQLite (embeds every incident's mechanism + surface forms). SQLite is always the source of truth; Chroma is a derived index you can throw away and rebuild any time. |
+| `omen memory list` | Lists every incident currently in the ledger, with its ref and how it was learned. |
+| `omen memory forget <ref>` | Deletes an incident from both SQLite and the vector index. This is the undo for a bad `omen learn` run. |
+| `omen learn <postmortem.md>` | Reads a postmortem file and forms a new memory (or updates a near-duplicate one) from it. |
+| `omen learn --from-git <range>` | Reads raw commit history (e.g. `HEAD~40..HEAD`) instead of a postmortem: a deterministic prefilter narrows the range to a handful of candidate commits, then each one is turned into a memory the same way. `--repo <path>` picks which repo to read history from (default: the current directory); supports `--max-commits`, `--max-learn`, and `--dry-run` (prefilter only, writes nothing). |
+| `omen scan <path>` | Runs the full investigation pipeline against everything currently in memory and prints a verdict per flagged chunk. `--dry-run` stops after chunking (no embeddings, no model calls); `--retrieval-only` stops after showing ranked candidate incidents (no generation). `--since <rev>` diffs against a specific ref instead of the working tree; `--all` scans the whole tracked tree. |
+| `omen calibrate` | Sweeps the retrieval similarity threshold over a labeled fixture set and prints where true positives stop surviving and hard negatives start getting rejected. A tuning tool for `SIMILARITY_THRESHOLD` in `config.py`, not part of the normal learn/scan workflow. |
+
+### How they fit together
+
+`learn` and `scan` are two ends of the same memory. `learn` is the only
+thing that writes to the ledger — every `write_incident` call it makes
+immediately re-embeds and rebuilds the vector index, so a freshly learned
+incident is retrievable by the very next `scan` without a manual `reindex`.
+`seed` and `reindex` exist to bootstrap and repair that same ledger by hand
+(load a starter set, or rebuild the index after editing SQLite directly).
+`memory list`/`forget` let you inspect and undo what's in there. `calibrate`
+is a standalone tuning loop against a fixture file, independent of the real
+ledger. In short: `seed`/`learn` put memories in, `reindex` keeps the index
+honest, `scan` reads against it, and `memory` lets you see and undo what's
+stored.
+
+## Agent architecture
+
+Omen runs one Gemma model, loaded once, with different prompts swapped in
+per role — it isn't several separate models. Each role is a distinct agent
+with a narrow job; the *order* they run in is fixed, ordinary Python, but
+each individual role is free to reason and (for two of them) call tools
+within its own turn.
+
+### Learning a memory (`omen learn`)
+
+1. **Sifter** *(git input only)* — a deterministic, no-LLM prefilter over a
+   commit range. It flags commits by message pattern (`fix`, `revert`,
+   `regression`, ...), revert detection, and touches to sensitive paths
+   (auth, cache, payment, permission code), cutting a large range down to a
+   handful of real candidates before any model call happens.
+2. **Archivist** — reads either the postmortem file or a candidate commit's
+   diff, and does the actual memory formation. Its central discipline is
+   **abstraction**: it writes the failure down as a technology-agnostic
+   *mechanism* ("a permission cache has no invalidation path tied to the
+   revocation event"), not as a description of the specific library or
+   framework involved — otherwise the memory could only ever match code
+   that happens to use the same stack. For the git-history path specifically,
+   it has to reconstruct the failure from the code's state *before* the fix
+   commit, not describe the fix itself — a fix commit shows the remedy, not
+   the bug. Before writing, it checks the existing ledger for a near-duplicate
+   (`search_memory`) and updates that entry instead of creating a redundant
+   one.
+
+### Scanning a codebase (`omen scan`)
+
+1. **Scout** — pure Python, no model. Resolves what's in scope (a diff, a
+   ref range, or the whole tree) and chunks each file by AST into
+   function/method/class-sized pieces the rest of the pipeline can reason
+   about individually.
+2. **Librarian** — embeds each chunk, queries the vector index for
+   similar incident mechanisms, collapses hits down to one candidate per
+   incident, and gates out anything below a calibrated similarity floor.
+   Also pure Python — no generation, just retrieval.
+3. **Triage** — the first model judgment. A fast, tool-free structured
+   verdict (`MATCH` / `NO_MATCH`) on whether a chunk's own failure mechanism
+   — reasoned independently, before comparing to the incident — actually
+   matches a retrieved candidate, as opposed to just sharing surface
+   vocabulary. Retrieval is deliberately generous, so Triage's default
+   assumption is `NO_MATCH`; it only escalates chunks it can state a
+   concrete mechanical reason for.
+4. **Investigator** — runs only on Triage's `MATCH` chunks. This is the
+   agentic step: it has tools (`read_code`, `grep_symbol`, `search_memory`,
+   `get_incident`) to check things a single chunk can't show on its own —
+   is there a mitigation elsewhere in the file, is this code actually
+   reachable on the path the incident cares about. It doesn't rule
+   MATCH/NO_MATCH itself; it produces an evidence-backed transcript for the
+   next stage to judge.
+5. **Adjudicator** — the final verdict: `confirmed`, `rejected`, or
+   `unverified`. Deliberately blind to Triage's reasoning and verdict — it
+   sees only the chunk, the candidate incidents, and the Investigator's
+   transcript, so it can't just rubber-stamp the first stage's opinion. A
+   `confirmed` verdict with no cited evidence lines is automatically
+   downgraded to `unverified` in code, never left to the model's judgment.
+
+Findings and run metadata are recorded to SQLite as the scan runs (visible
+via the tables `runs`, `findings`, and `tool_calls`, the latter giving a
+full audit trail of every tool call made during an investigation); a
+rendered report beyond the terminal summary isn't built yet.
+
+### Two execution backends
+
+Every role runs through a `RoleRunner` interface with two interchangeable
+implementations, selectable per-command with `--runner={adk,direct}`:
+`ADKRoleRunner` (Google's Agent Development Kit) is the default, and
+`DirectOllamaRunner` talks to Ollama directly as a fallback if ADK's
+structured-output or tool-calling path misbehaves. Both are fully
+implemented and tested equally, not one real path and one stub.
+
+### Data model
+
+SQLite is the source of truth for everything durable: incidents (with their
+abstracted mechanism and concrete surface forms), a hash-cache of computed
+embeddings, run records, findings, and the tool-call audit trail. Chroma
+holds only a derived vector index for semantic retrieval — it's rebuilt
+from SQLite by `omen reindex` and never written to directly, so it can be
+deleted and regenerated at any time without losing anything.
+
+## Testing
+
+```
+pytest                     # full suite; most tests need a reachable Ollama instance
+pytest tests/test_scout.py # fast, no model required
+```
+
+Tests that require live inference are written that way deliberately —
+prompt quality for a system like this can't be meaningfully verified with
+mocks, so most of the suite exercises the real model rather than stubbing
+it out.

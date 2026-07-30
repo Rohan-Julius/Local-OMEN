@@ -312,7 +312,12 @@ class ToolBudget:
 
     @staticmethod
     def _key(tool_name: str, kwargs: dict) -> tuple:
-        return (tool_name, tuple(sorted(kwargs.items())))
+        # json.dumps rather than tuple(sorted(kwargs.items())): a tool
+        # argument can itself be a list (write_incident's surface_forms),
+        # which is unhashable and breaks a plain tuple/dict key. Every tool
+        # argument in this module is JSON-serializable, so this is a safe
+        # and still order-independent (sort_keys) cache key.
+        return (tool_name, json.dumps(kwargs, sort_keys=True))
 
     def invoke(self, tools: dict[str, Callable], tool_name: str, kwargs: dict) -> tuple[bool, object, str | None]:
         """Returns (ok, result, note). `ok=False` means the tool did not
@@ -372,9 +377,11 @@ def budgeted_tools(
     def make_wrapper(name: str, fn: Callable) -> Callable:
         @functools.wraps(fn)
         def wrapper(**kwargs):
+            start = time.monotonic()
             ok, result, note = budget.invoke(tools, name, kwargs)
+            ms = round((time.monotonic() - start) * 1000)
             result_str = _stringify(result) if ok else ""
-            step = ToolCallStep(tool_name=name, args=kwargs, result=result_str, note=note)
+            step = ToolCallStep(tool_name=name, args=kwargs, result=result_str, note=note, ms=ms)
             steps.append(step)
             if on_step:
                 on_step(step)
