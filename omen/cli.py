@@ -9,7 +9,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from omen import librarian, scout, store, vectors
+from omen import config, fixtures as fixtures_mod, librarian, scout, store, vectors
 
 
 def cmd_seed(args: argparse.Namespace) -> None:
@@ -86,6 +86,53 @@ def cmd_scan(args: argparse.Namespace) -> None:
     _print_chunk_table(chunks)
 
 
+def cmd_calibrate(args: argparse.Namespace) -> None:
+    """PLAN.md Phase 4: sweep the similarity floor over the 12 labeled
+    fixtures and print where true positives stop surviving and where hard
+    negatives start being rejected — the "knee" to set SIMILARITY_THRESHOLD
+    to. If a true_match can't be pushed above any reasonable floor, per
+    PLAN.md that's a signal about incidents.yaml's surface forms, not the
+    threshold — do not chase it by lowering the floor.
+    """
+    conn = store.connect()
+    cases = fixtures_mod.load_fixtures(Path(args.fixtures_path))
+    chunks = [fixtures_mod.fixture_to_chunk(f) for f in cases]
+    embeddings, stats = librarian.embed_chunks(conn, chunks)
+    print(f"embed cache: {stats.n_cache_hits}/{stats.n_total} hits\n")
+
+    results = []
+    for case, chunk in zip(cases, chunks):
+        hits = vectors.query_chunk(embeddings[chunk.content_hash], n_results=librarian.QUERY_N_RESULTS)
+        candidates = librarian.collapse_to_incidents(hits)
+        results.append((case, candidates))
+
+    print(f"{'id':4} {'label':13} {'target':8} top candidates")
+    for case, candidates in results:
+        cand_str = ", ".join(f"{c.incident_ref}={c.similarity:.3f}" for c in candidates) or "(none)"
+        print(f"{case.id:4} {case.label:13} {case.target_ref or '-':8} {cand_str}")
+
+    true_matches = [(c, cands) for c, cands in results if c.label == "true_match"]
+    hard_negatives = [(c, cands) for c, cands in results if c.label == "hard_negative"]
+    unrelated = [(c, cands) for c, cands in results if c.label == "unrelated"]
+
+    print(f"\n{'threshold':>9}  {'TP survive':>10}  {'HN survive':>10}  {'unrelated survive':>17}")
+    for i in range(0, 21):
+        t = round(i * 0.05, 2)
+        tp = sum(
+            1 for case, cands in true_matches
+            if any(c.incident_ref == case.target_ref and c.similarity >= t for c in cands)
+        )
+        hn = sum(1 for _, cands in hard_negatives if any(c.similarity >= t for c in cands))
+        un = sum(1 for _, cands in unrelated if any(c.similarity >= t for c in cands))
+        marker = "  <- current SIMILARITY_THRESHOLD" if abs(t - config.SIMILARITY_THRESHOLD) < 1e-9 else ""
+        print(f"{t:>9.2f}  {tp:>7}/4     {hn:>7}/4     {un:>14}/4{marker}")
+
+    print(
+        "\nPLAN.md acceptance: all 4 true positives survive AND at most 2/4 hard "
+        "negatives survive. Pick the highest threshold that still keeps 4/4 TP."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="omen")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -118,6 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Embed + query Chroma, print ranked candidates, no generation (~2s, no LLM)",
     )
     p_scan.set_defaults(func=cmd_scan)
+
+    p_calibrate = sub.add_parser("calibrate", help="Sweep the similarity floor over fixtures/fixtures.yaml")
+    p_calibrate.add_argument("--fixtures-path", default=str(fixtures_mod.DEFAULT_FIXTURES_PATH))
+    p_calibrate.set_defaults(func=cmd_calibrate)
 
     return parser
 

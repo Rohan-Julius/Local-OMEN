@@ -60,10 +60,10 @@ incidents:
     source: "postmortem:seed"
     learned_by: seed
     surface_forms:
-      - "a Celery task retry with a fixed countdown= value and no jitter"
-      - "a while loop reconnecting to a database every second on ConnectionError"
-      - "a frontend fetch() wrapped in a retry helper that always waits the same delay"
-      - "a cron job that re-runs immediately on failure with no exponential delay"
+      - "a Celery task retry with a fixed countdown= value and no exponential backoff or jitter"
+      - "a while loop reconnecting to a database that sleeps a constant fixed number of seconds between attempts, with no exponential backoff and no random jitter"
+      - "a frontend fetch() wrapped in a retry helper that always waits the identical delay on every attempt, never increasing"
+      - "a cron job that re-runs immediately on failure with no exponential delay or backoff strategy at all"
 
   - ref: OMEN-003
     title: Credential leaked into logs

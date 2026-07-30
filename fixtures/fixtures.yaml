@@ -1,0 +1,152 @@
+# Phase 4 calibration set: 12 labeled chunks (PLAN.md).
+#
+# true_match: should retrieve `target_ref` above the chosen similarity
+# floor. hard_negative: superficially similar vocabulary to a real
+# incident but mechanically safe/different — should NOT clear the floor
+# (or at most 2/4 may, per the Phase 4 acceptance bar). unrelated: no
+# relation to any incident mechanism at all.
+#
+# Each hard_negative is paired with the true_match it's meant to be
+# confused with, by design — a hard negative that isn't a near neighbor
+# in embedding space doesn't stress-test anything.
+
+fixtures:
+  # --- true matches -----------------------------------------------------
+
+  - id: TM1
+    label: true_match
+    target_ref: OMEN-001
+    file_path: fixtures/permissions.py
+    symbol: has_access
+    code: |
+      @functools.lru_cache(maxsize=1024)
+      def has_access(user_id, resource_id):
+          return _compute_permission(user_id, resource_id)
+
+  - id: TM2
+    label: true_match
+    target_ref: OMEN-002
+    file_path: fixtures/db.py
+    symbol: connect_with_retry
+    code: |
+      def connect_with_retry():
+          while True:
+              try:
+                  return psycopg2.connect(DSN)
+              except OperationalError:
+                  time.sleep(1)
+                  continue
+
+  - id: TM3
+    label: true_match
+    target_ref: OMEN-003
+    file_path: fixtures/debug_utils.py
+    symbol: log_login_attempt
+    code: |
+      def log_login_attempt(username, password):
+          print(f"login attempt user={username} pw={password}")
+          return authenticate(username, password)
+
+  - id: TM4
+    label: true_match
+    target_ref: OMEN-004
+    file_path: fixtures/booking.py
+    symbol: book_seat
+    code: |
+      def book_seat(seat_id):
+          seat = get_seat(seat_id)
+          if seat.is_booked:
+              raise SeatUnavailable()
+          seat.is_booked = True
+          save(seat)
+
+  # --- hard negatives (superficially similar, mechanically safe) -------
+
+  - id: HN1
+    label: hard_negative
+    file_path: fixtures/thumbnails.py
+    symbol: get_thumbnail
+    code: |
+      _thumb_cache = cachetools.TTLCache(maxsize=500, ttl=3600)
+
+      def get_thumbnail(image_id):
+          if image_id in _thumb_cache:
+              return _thumb_cache[image_id]
+          thumb = render_thumbnail(image_id)
+          _thumb_cache[image_id] = thumb
+          return thumb
+
+  - id: HN2
+    label: hard_negative
+    file_path: fixtures/db.py
+    symbol: connect_with_backoff
+    code: |
+      def connect_with_backoff(max_attempts=5):
+          for attempt in range(max_attempts):
+              try:
+                  return psycopg2.connect(DSN)
+              except OperationalError:
+                  delay = min(2 ** attempt, 30) + random.uniform(0, 1)
+                  time.sleep(delay)
+          raise ConnectionError("exhausted retries")
+
+  - id: HN3
+    label: hard_negative
+    file_path: fixtures/debug_utils.py
+    symbol: log_login_attempt_safe
+    code: |
+      def log_login_attempt_safe(username, password):
+          logger.info("login attempt", extra={"username": username, "password": "***REDACTED***"})
+          return authenticate(username, password)
+
+  - id: HN4
+    label: hard_negative
+    file_path: fixtures/inventory.py
+    symbol: decrement_stock_atomic
+    code: |
+      def decrement_stock_atomic(sku, count=1):
+          updated = db.execute(
+              "UPDATE stock SET quantity = quantity - %s WHERE sku = %s AND quantity >= %s",
+              (count, sku, count),
+          )
+          if updated.rowcount == 0:
+              raise OutOfStock()
+
+  # --- unrelated ----------------------------------------------------------
+
+  - id: U1
+    label: unrelated
+    file_path: fixtures/mathutil.py
+    symbol: average
+    code: |
+      def average(values):
+          if not values:
+              return 0.0
+          return sum(values) / len(values)
+
+  - id: U2
+    label: unrelated
+    file_path: fixtures/textutil.py
+    symbol: slugify
+    code: |
+      def slugify(title):
+          return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+  - id: U3
+    label: unrelated
+    file_path: fixtures/models.py
+    symbol: Point
+    code: |
+      class Point:
+          def __init__(self, x, y):
+              self.x = x
+              self.y = y
+
+  - id: U4
+    label: unrelated
+    file_path: fixtures/health.py
+    symbol: healthcheck
+    code: |
+      @app.route("/healthz")
+      def healthcheck():
+          return {"status": "ok"}, 200

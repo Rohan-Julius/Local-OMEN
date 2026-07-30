@@ -68,6 +68,20 @@ class GatedChunk(BaseModel):
     candidates: list[RetrievalCandidate]
 
 
+class FixtureCase(BaseModel):
+    """One labeled chunk in fixtures/fixtures.yaml (Phase 4 calibration and
+    the ongoing regression gate). `target_ref` is set only for
+    true_match — hard_negative and unrelated fixtures should not clear
+    the gate for any incident."""
+
+    id: str
+    label: Literal["true_match", "hard_negative", "unrelated"]
+    target_ref: str | None = None
+    file_path: str
+    symbol: str
+    code: str
+
+
 # ---------------------------------------------------------------------------
 # Triage / Investigator / Adjudicator (scan mission, judgment side)
 # ---------------------------------------------------------------------------
