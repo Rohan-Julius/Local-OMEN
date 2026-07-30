@@ -1,0 +1,173 @@
+# Seed ledger for `omen seed incidents.yaml` (Phase 1).
+#
+# This file is the highest-leverage work in the whole build (PLAN.md, Phase 1):
+# thin surface_forms cap retrieval quality for everything downstream.
+#
+# Each incident's failure_mechanism is abstracted off its original
+# technology. surface_forms deliberately span technologies the incident
+# never involved — that's what makes retrieval "semantic" rather than a
+# keyword match in disguise. OMEN-001 is the one the demo's true-positive
+# chunk (a functools.lru_cache on a permission lookup) is meant to match,
+# with no Redis/TTL vocabulary shared between them.
+#
+# 6 incidents here; a 7th arrives live via `omen learn --from-git` during
+# the demo.
+
+incidents:
+  - ref: OMEN-001
+    title: Stale permission cache after revocation
+    failure_mechanism: >-
+      An authorization decision is cached with no invalidation path tied to
+      the permission-changing event, so a revoked or downgraded permission
+      keeps succeeding until the cache entry expires on its own or the
+      process restarts.
+    what_happened: >-
+      A user's admin role was revoked after a security incident, but a
+      Redis-backed permission cache with a 30-minute TTL and no explicit
+      invalidation on role change kept authorizing their admin actions for
+      the remainder of the TTL window.
+    the_rule: >-
+      Any cache keyed on an authorization decision must be invalidated
+      explicitly by the event that changes the permission (role update,
+      revocation, deactivation) — a TTL alone is not sufficient.
+    severity: sev1
+    occurred_on: "2025-02-11"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "functools.lru_cache wrapping a has_access or can_edit permission check"
+      - "a plain module-level dict used to memoize a role lookup by user id"
+      - "cachetools.TTLCache storing the result of an is_admin check"
+      - "Django's cache.set() called after checking a permission, with no cache.delete() on the permission-change signal"
+
+  - ref: OMEN-002
+    title: Retry storm without backoff overwhelms recovering service
+    failure_mechanism: >-
+      Failed requests are retried on a fixed, unjittered interval, so when a
+      downstream dependency comes back up after an outage, every waiting
+      client retries in the same instant and the resulting spike takes it
+      back down.
+    what_happened: >-
+      A payments service went down for two minutes. Every client used a
+      `requests` session configured to retry three times at a fixed 1-second
+      interval with no jitter. When the service recovered, thousands of
+      queued retries landed in the same second and re-triggered the outage.
+    the_rule: >-
+      Any automatic retry must use exponential backoff with jitter, and
+      should cap total concurrent retries against a single dependency.
+    severity: sev2
+    occurred_on: "2025-04-03"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "a Celery task retry with a fixed countdown= value and no jitter"
+      - "a while loop reconnecting to a database every second on ConnectionError"
+      - "a frontend fetch() wrapped in a retry helper that always waits the same delay"
+      - "a cron job that re-runs immediately on failure with no exponential delay"
+
+  - ref: OMEN-003
+    title: Credential leaked into logs
+    failure_mechanism: >-
+      A sensitive value (password, API key, token, connection string) flows
+      unredacted into a log line, error message, or crash report, where it
+      persists in a system with broader read access than the value itself
+      warrants.
+    what_happened: >-
+      An exception handler logged the full exception message from a failed
+      database connection attempt, which included the connection string
+      with the database password embedded, at INFO level to a log
+      aggregator readable by the whole engineering org.
+    the_rule: >-
+      Never log an exception's raw message or a raw request/response body
+      without redacting known-sensitive fields first; construct log
+      messages from named fields, not from stringifying the whole object.
+    severity: sev2
+    occurred_on: "2025-05-19"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "print(f\"...\") that interpolates a password or token variable for debugging"
+      - "logger.info() called with an entire incoming request object, including headers"
+      - "a Sentry/error-reporting call that attaches the full local variable scope"
+      - "a debug endpoint that dumps os.environ or process env vars as JSON"
+
+  - ref: OMEN-004
+    title: Check-then-act race condition without atomicity
+    failure_mechanism: >-
+      Code reads some state, decides an action is safe based on that read,
+      then performs the action in a separate step with no lock or
+      transaction spanning both — so two concurrent callers can both pass
+      the check and both perform the action, violating an invariant that
+      was assumed to hold.
+    what_happened: >-
+      An inventory service checked `if quantity > 0` and then decremented
+      the quantity in a separate UPDATE statement with no row lock or
+      transaction. Two concurrent checkout requests both read a quantity of
+      1, both passed the check, and the item was sold twice.
+    the_rule: >-
+      Any check-then-act sequence on shared mutable state must be made
+      atomic — a single `UPDATE ... WHERE` with the guard condition, a
+      `SELECT ... FOR UPDATE`, or an equivalent compare-and-swap — not a
+      read followed by a separate write.
+    severity: sev1
+    occurred_on: "2025-01-27"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "if not User.objects.filter(email=email).exists(): User.objects.create(email=email)"
+      - "reading a seat's is_booked flag, then writing True in a later statement"
+      - "checking an account balance in Python, then issuing a separate debit call"
+      - "os.path.exists() followed by a separate open(path, 'w') without O_EXCL"
+
+  - ref: OMEN-005
+    title: Unbounded query loads entire table into memory
+    failure_mechanism: >-
+      A data-access path fetches an entire result set with no limit,
+      pagination, or streaming, so memory use and latency scale with total
+      row count rather than with what the caller actually needed — fine at
+      launch, an outage once the table grows.
+    what_happened: >-
+      An admin "export all users" feature called `.all()` on a SQLAlchemy
+      query with no limit. It worked fine in staging with 500 rows; in
+      production with 40 million rows it exhausted the worker's memory and
+      took the whole process down.
+    the_rule: >-
+      Any endpoint or job that can return a growing collection must paginate
+      or stream by default; unbounded fetches require an explicit,
+      reviewed opt-in with a hard cap.
+    severity: sev2
+    occurred_on: "2025-06-08"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "MyModel.query.all() used to build a JSON API response"
+      - "a MongoDB find() with no .limit() feeding a CSV export"
+      - "a for loop over a full cursor.fetchall() result held in a Python list"
+      - "a GraphQL resolver that returns every row of a relation with no pagination arguments"
+
+  - ref: OMEN-006
+    title: Naive datetime comparison breaks across a DST boundary
+    failure_mechanism: >-
+      Timezone-naive datetimes, or a mix of local and UTC timestamps, are
+      compared or subtracted directly, so results are silently wrong by an
+      hour (or a full day, once a comparison against a date boundary is
+      involved) around a daylight-saving-time transition.
+    what_happened: >-
+      A billing job compared `datetime.now()` (naive, local time) against a
+      UTC timestamp stored in the database to decide whether an invoice was
+      overdue. On the night of the DST transition, the hour offset flipped
+      several invoices between "due today" and "overdue," double-charging
+      some customers.
+    the_rule: >-
+      Store and compare timestamps in UTC end to end; convert to local time
+      only at the display boundary, and never compare a naive datetime
+      against an aware one.
+    severity: sev2
+    occurred_on: "2025-03-09"
+    source: "postmortem:seed"
+    learned_by: seed
+    surface_forms:
+      - "a cron schedule expressed in local time with no timezone attached"
+      - "JavaScript new Date(dateString) compared against an ISO 8601 UTC string"
+      - "a pandas date_range() spanning a DST transition producing a duplicate or missing hour"
+      - "Python's datetime.now() subtracted from a timezone-aware datetime, raising or silently truncating"

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# derived index — rebuildable from SQLite via `omen reindex`
+omen_store/chroma/
+
+# ledger DB — decide per-machine whether this is tracked or seeded fresh
+*.db
+*.sqlite3
+
+.env

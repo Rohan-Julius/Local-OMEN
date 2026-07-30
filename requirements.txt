@@ -1,0 +1,10 @@
+# Pinned in Phase 0 on the RTX 5050 (Windows, Python 3.11.9) — dev and
+# demo are the same machine, so there is only one set of versions to match.
+google-adk==2.5.0
+litellm==1.94.0
+chromadb==1.5.9
+pydantic==2.13.4
+ollama==0.6.2
+pyyaml==6.0.3
+pytest==9.1.1
+pytest-asyncio==1.4.0
