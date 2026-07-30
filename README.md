@@ -92,6 +92,31 @@ with a 10-line overlap, module-level statements bundled into one
 requires (non-git dir, unparseable file, over-long function) plus extra
 coverage on class methods, decorators, and content-hash determinism.
 
+### Phase 3 results
+
+`librarian.py`: hash-cached embedding (batches of 32, `omen/store.py`'s
+`chunk_vectors` table), Chroma query at `n_results=6` on variant level,
+collapse to best-variant-per-incident, cap at top 3, gate by similarity
+(`SIMILARITY_THRESHOLD` in `config.py` — a placeholder until Phase 4's
+fixture sweep). Wired into `omen scan <path> --retrieval-only`, the
+zero-generation demoable artifact the plan wants at this point.
+
+- **Manual end-to-end check**: a `functools.lru_cache`-decorated
+  `has_access` (the planned demo true positive) retrieves OMEN-001 at
+  0.507 similarity; the actual hard-negative function in a parallel
+  `response_cache.py` (`get_static_page`, a real but unrelated cache)
+  does **not** clear the threshold at all — only weaker incidental
+  matches (a helper function, a bare `_cache = {}` declaration) do,
+  which is expected at the retrieval-only gate and exactly what Triage's
+  mechanism-first reasoning (Phase 6) exists to filter further.
+- Cache verified: 0/4 hits on first run, 4/4 hits on an identical rerun.
+- 23/23 tests pass (`tests/test_librarian.py` + `test_scout.py`):
+  `collapse_to_incidents`/`gate` logic tested with no network dependency;
+  the cache is tested with a monkeypatched embedder; one live end-to-end
+  test (skips gracefully if Ollama is unreachable) pins the Phase 3
+  acceptance criterion directly, against an isolated Chroma path so it
+  can never touch the real seeded ledger.
+
 ## Setup
 
 ```

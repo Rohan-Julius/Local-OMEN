@@ -30,3 +30,11 @@ STORE_DIR = Path("omen_store")
 DB_PATH = STORE_DIR / "omen.db"
 CHROMA_PATH = STORE_DIR / "chroma"
 CHROMA_COLLECTION = "incidents"
+
+# Librarian (Phase 3). SIMILARITY_THRESHOLD is a placeholder until Phase 4's
+# fixture sweep picks the real knee — PLAN.md is explicit that guessing this
+# number and hoping the LLM compensates is the wrong move.
+EMBED_BATCH_SIZE = 32
+QUERY_N_RESULTS = 6  # variant-level; collapsed to incidents before capping
+TOP_K_INCIDENTS = 3
+SIMILARITY_THRESHOLD = 0.35
