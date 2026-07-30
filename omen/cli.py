@@ -7,9 +7,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from pathlib import Path
 
 from omen import config, fixtures as fixtures_mod, librarian, scout, store, vectors
+
+# Windows consoles default to a legacy codepage that mangles em-dashes and
+# other non-ASCII content living in incident/postmortem text (renders as
+# "�"). Force UTF-8 stdout/stderr so arbitrary ledger content prints
+# correctly regardless of host codepage.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 def cmd_seed(args: argparse.Namespace) -> None:

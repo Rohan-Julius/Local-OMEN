@@ -154,6 +154,40 @@ getting rejected.
   prompt or config change that lifts recall while wrecking precision
   must fail here, not on stage. 26/26 tests pass project-wide.
 
+### Phase 5 results
+
+`tools.py`: the 7 tool functions (`read_code`, `grep_symbol`,
+`search_memory`, `get_incident` for scanning; `read_file`, `read_commit`,
+`read_diff`, `write_incident` for learning — `search_memory` and
+`write_incident` are shared/reused across the learn tool sets) plus
+`ToolBudget`, the orchestrator-side enforcement of the three hard caps:
+max 6 total calls, a duplicate-call cache (a repeat of the same
+tool+args is served from cache with a note instead of re-executing —
+verified the underlying tool genuinely only runs once), and a 90s
+wall-clock ceiling. All three enforced in `ToolBudget.invoke`, never
+left to a prompt.
+
+- Path confinement (`confine()`) rejects both relative traversal
+  (`../../etc/passwd`) and absolute-path escapes for `read_code` and
+  `read_file`; `read_diff` doesn't need it since git resolves paths
+  against its own object database for that commit, not the host
+  filesystem — a traversal attempt there just fails to match a tracked
+  path.
+- Tool sets are built per mission and per input path, never pooled:
+  `build_scan_tools` (4), `build_learn_postmortem_tools` (3),
+  `build_learn_git_tools` (4) — asserted directly in tests.
+- Found and fixed a real Windows-console bug along the way: em-dashes in
+  incident prose (not just in my own print statements this time — the
+  *data* itself) were rendering as `�`. Fixed once, generally, by forcing
+  UTF-8 stdout/stderr in `cli.py`'s entry point rather than hunting every
+  em-dash in content.
+- 25 new tests (51 total project-wide): read_code/read_file traversal
+  rejection, grep_symbol whole-word matching and skip-dir behavior,
+  read_commit/read_diff against a real temp git repo (including
+  truncation at the line cap), write_incident create + auto-increment +
+  update-by-ref against an isolated store, and all three ToolBudget caps
+  plus a live search_memory/get_incident test (skips without Ollama).
+
 ## Setup
 
 ```

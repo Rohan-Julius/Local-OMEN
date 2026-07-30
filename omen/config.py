@@ -31,10 +31,24 @@ DB_PATH = STORE_DIR / "omen.db"
 CHROMA_PATH = STORE_DIR / "chroma"
 CHROMA_COLLECTION = "incidents"
 
-# Librarian (Phase 3). SIMILARITY_THRESHOLD is a placeholder until Phase 4's
-# fixture sweep picks the real knee — PLAN.md is explicit that guessing this
-# number and hoping the LLM compensates is the wrong move.
+# Librarian (Phase 3). SIMILARITY_THRESHOLD chosen by Phase 4's fixture
+# sweep: 4/4 true positives survive, 2/4 hard negatives survive (the
+# PLAN.md acceptance bar) — see README.md "Phase 4 results" for the sweep
+# and why the margin (0.344 rejected vs 0.360 weakest true positive) is
+# real but tight.
 EMBED_BATCH_SIZE = 32
 QUERY_N_RESULTS = 6  # variant-level; collapsed to incidents before capping
 TOP_K_INCIDENTS = 3
 SIMILARITY_THRESHOLD = 0.35
+
+# Memory ref format (Phase 5+): OMEN-001, OMEN-002, ... assigned by
+# write_incident when the Archivist creates a new entry.
+REF_PREFIX = "OMEN"
+
+# Tool budget (Phase 5). PLAN.md: "an agent loop is an unbounded loop" —
+# these three caps are enforced in the orchestrator (tools.py's
+# ToolBudget), never merely requested in a prompt.
+MAX_TOOL_CALLS = 6
+TOOL_WALL_CLOCK_SECONDS = 90
+GREP_MAX_HITS = 50
+DIFF_LINE_CAP = 300

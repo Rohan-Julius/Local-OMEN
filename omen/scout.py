@@ -15,7 +15,7 @@ from omen.contracts import Chunk
 CHUNK_LINE_CAP = 120
 CHUNK_OVERLAP = 10
 
-_SKIP_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
+SKIP_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ def _is_git_repo(repo_path: Path) -> bool:
 def _walk_py_files(repo_path: Path) -> list[Path]:
     files = []
     for path in repo_path.rglob("*.py"):
-        if any(part in _SKIP_DIR_NAMES or part.startswith(".") for part in path.relative_to(repo_path).parts[:-1]):
+        if any(part in SKIP_DIR_NAMES or part.startswith(".") for part in path.relative_to(repo_path).parts[:-1]):
             continue
         files.append(path)
     return sorted(files)
