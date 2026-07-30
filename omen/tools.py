@@ -10,6 +10,8 @@ agent every tool degrades small-model routing accuracy.
 """
 from __future__ import annotations
 
+import functools
+import json
 import re
 import sqlite3
 import subprocess
@@ -19,7 +21,7 @@ from typing import Callable
 
 from omen import librarian, scout, store, vectors
 from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, TOOL_WALL_CLOCK_SECONDS
-from omen.contracts import IncidentSeed
+from omen.contracts import IncidentSeed, ToolCallStep
 
 # ---------------------------------------------------------------------------
 # Path confinement
@@ -340,3 +342,47 @@ class ToolBudget:
 
         self._cache[key] = result
         return True, result, None
+
+
+def _stringify(result: object) -> str:
+    return result if isinstance(result, str) else json.dumps(result)
+
+
+def budgeted_tools(
+    tools: dict[str, Callable],
+    budget: ToolBudget,
+    on_step: Callable[[ToolCallStep], None] | None = None,
+) -> tuple[list[Callable], list[ToolCallStep]]:
+    """Wrap each tool so every invocation goes through `budget` (caps,
+    dedup cache, error handling) and is recorded into the returned
+    transcript list. The wrapper preserves the original signature and
+    docstring via functools.wraps, so it's usable as-is by both ADK's
+    `LlmAgent(tools=...)` and `ollama.chat(tools=...)` — neither needs to
+    know the call was mediated; both just see a normal callable.
+
+    `on_step`, if given, fires the moment each call is recorded — this is
+    what lets the orchestrator stream tool calls to the terminal live
+    (PLAN.md Phase 6) regardless of which runner is driving the loop.
+
+    Returns (wrapped_callables, steps) — `steps` is mutated in place as
+    calls happen, so the caller can inspect it even mid-loop.
+    """
+    steps: list[ToolCallStep] = []
+
+    def make_wrapper(name: str, fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(**kwargs):
+            ok, result, note = budget.invoke(tools, name, kwargs)
+            result_str = _stringify(result) if ok else ""
+            step = ToolCallStep(tool_name=name, args=kwargs, result=result_str, note=note)
+            steps.append(step)
+            if on_step:
+                on_step(step)
+            if not ok:
+                return note
+            return result
+
+        return wrapper
+
+    wrapped = [make_wrapper(name, fn) for name, fn in tools.items()]
+    return wrapped, steps

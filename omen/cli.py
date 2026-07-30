@@ -10,7 +10,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-from omen import config, fixtures as fixtures_mod, librarian, scout, store, vectors
+from omen import agents, config, fixtures as fixtures_mod, librarian, runners, scout, store, tools as tools_mod, vectors
+from omen.contracts import GatedChunk, RetrievalCandidate, TriageVerdict
 
 # Windows consoles default to a legacy codepage that mangles em-dashes and
 # other non-ASCII content living in incident/postmortem text (renders as
@@ -61,10 +62,79 @@ def _print_chunk_table(chunks) -> None:
         print(f"{c.file_path:40}  {c.symbol:{symbol_width}}  {span:>9}  {c.content_hash[:8]}")
 
 
-def cmd_scan(args: argparse.Namespace) -> None:
-    repo_path = Path(args.path)
+def _format_triage_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> str:
+    lines = [
+        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):",
+        chunk.content,
+        "",
+        "CANDIDATE INCIDENTS:",
+    ]
+    for cand in candidates:
+        incident = store.get_incident(conn, cand.incident_ref)
+        if incident is None:
+            continue
+        lines.append(f"{incident.ref}: {incident.title}")
+        lines.append(f"  failure_mechanism: {incident.failure_mechanism}")
+        lines.append(f"  the_rule: {incident.the_rule}")
+    return "\n".join(lines)
+
+
+def _format_investigator_prompt(chunk, verdict: TriageVerdict, candidates: list[RetrievalCandidate]) -> str:
+    refs = ", ".join(c.incident_ref for c in candidates)
+    return (
+        f"Triage ruled MATCH on this chunk against candidate incident(s) {refs}.\n"
+        f"Triage's stated mechanism: {verdict.code_mechanism}\n\n"
+        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):\n"
+        f"{chunk.content}\n\n"
+        f"Investigate whether this chunk actually shares the candidate incident's failure mechanism."
+    )
+
+
+async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Path, gated: list[GatedChunk]) -> None:
+    runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
+    triage_instruction = agents.load_prompt("triage.txt")
+    investigator_instruction = agents.load_prompt("investigator.txt")
+
+    for gc in gated:
+        c = gc.chunk
+        print(f"\n=== {c.file_path}:{c.symbol} ({c.start_line}-{c.end_line}) ===")
+        for cand in gc.candidates:
+            print(f"  candidate: {cand.incident_ref}  similarity={cand.similarity:.3f}  ({cand.matched_variant})")
+
+        triage_prompt = _format_triage_prompt(conn, c, gc.candidates)
+        verdict = await runner.run_structured(triage_instruction, triage_prompt, TriageVerdict, think=config.THINK_DEFAULT)
+        print(f"  [triage] verdict={verdict.verdict}  confidence={verdict.confidence}")
+        print(f"  [triage] mechanism: {verdict.code_mechanism}")
+        print(f"  [triage] reasoning: {verdict.reasoning}")
+
+        if verdict.verdict != "MATCH":
+            continue
+
+        print("  [investigator] investigating...")
+        scan_tools = tools_mod.build_scan_tools(repo_path, conn)
+        budget = tools_mod.ToolBudget()
+        investigator_prompt = _format_investigator_prompt(c, verdict, gc.candidates)
+
+        def on_step(step) -> None:
+            note = f"  ({step.note})" if step.note else ""
+            print(f"    [tool] {step.tool_name}({step.args}) -> {step.result[:100]!r}{note}")
+
+        transcript = await runner.run_tooled(
+            investigator_instruction,
+            investigator_prompt,
+            scan_tools,
+            budget,
+            think=config.INVESTIGATOR_THINK_DEFAULT,
+            on_step=on_step,
+        )
+        print(f"  [investigator] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+        print(f"  [investigator] summary: {transcript.final_text}")
+
+
+async def cmd_scan(args: argparse.Namespace) -> None:
+    repo_path = Path(args.path).resolve()
     scope_result = scout.resolve_scope(repo_path, since=args.since, all_files=args.all)
-    chunks = scout.chunk_files(scope_result.files, repo_root=repo_path.resolve())
+    chunks = scout.chunk_files(scope_result.files, repo_root=repo_path)
     print(f"scope: {scope_result.scope}  ({len(scope_result.files)} file(s), {len(chunks)} chunk(s))")
     if not chunks:
         return
@@ -73,15 +143,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
         _print_chunk_table(chunks)
         return
 
+    conn = store.connect()
+    gated, stats = librarian.run(conn, chunks)
+    print(f"embed cache: {stats.n_cache_hits}/{stats.n_total} hits ({stats.n_cache_misses} miss(es) embedded)")
+    print(f"{len(gated)}/{len(chunks)} chunk(s) cleared the similarity threshold ({librarian.SIMILARITY_THRESHOLD})")
+
     if args.retrieval_only:
-        conn = store.connect()
-        gated, stats = librarian.run(conn, chunks)
-        print(
-            f"embed cache: {stats.n_cache_hits}/{stats.n_total} hits "
-            f"({stats.n_cache_misses} miss(es) embedded)"
-        )
         if not gated:
-            print(f"No chunks cleared the similarity threshold ({librarian.SIMILARITY_THRESHOLD}).")
             return
         for gc in gated:
             c = gc.chunk
@@ -90,9 +158,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 print(f"    {cand.incident_ref}  {cand.similarity:.3f}  {cand.matched_variant}")
         return
 
-    print("Full scan pipeline (Triage/Investigator/Adjudicator) isn't built yet - Phase 3 gives retrieval only.")
-    print("Showing the chunk table `--dry-run` would produce:")
-    _print_chunk_table(chunks)
+    if not gated:
+        return
+    await _triage_and_investigate(args, conn, repo_path, gated)
 
 
 def cmd_calibrate(args: argparse.Namespace) -> None:
@@ -173,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Embed + query Chroma, print ranked candidates, no generation (~2s, no LLM)",
     )
+    p_scan.add_argument(
+        "--runner",
+        choices=["adk", "direct"],
+        default="adk",
+        help="adk (default) or direct — the reversibility hedge if ADK's schema or tool path is flaky",
+    )
     p_scan.set_defaults(func=cmd_scan)
 
     p_calibrate = sub.add_parser("calibrate", help="Sweep the similarity floor over fixtures/fixtures.yaml")
@@ -185,7 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    result = args.func(args)
+    if asyncio.iscoroutine(result):
+        await result
 
 
 if __name__ == "__main__":

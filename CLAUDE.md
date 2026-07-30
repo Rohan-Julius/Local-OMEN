@@ -17,13 +17,16 @@ The working directory on disk is still `Local-lore` (unrenamed — renaming an
 open project directory has its own risk and wasn't part of the code/docs
 rename).
 
-**Current state:** Phases 0-1 done (env verified, `contracts.py`, `store.py`,
-`vectors.py`, seed `incidents.yaml` — see README.md for details and
-acceptance results). Everything from Phase 2 on (`scout.py`, `librarian.py`,
-`tools.py`, `agents.py`, `runners.py`, `archivist.py`, `report.py`,
-`sifter.py`, and everything under `tests/` and `prompts/`) is still an empty
-stub — don't assume any of those modules does something without checking
-it's actually implemented.
+**Current state:** Phases 0-6 done (env verified; contracts/store/vectors;
+Scout; Librarian + `--retrieval-only`; fixtures/calibration GO/NO-GO passed;
+tools.py + ToolBudget; Triage + Investigator via both ADKRoleRunner and
+DirectOllamaRunner, wired into `omen scan`'s real pipeline — see README.md
+for details and acceptance results per phase). `archivist.py`, `sifter.py`,
+`report.py` and the Adjudicator (Phase 7 on) are still empty/unbuilt — don't
+assume those do something without checking. `omen scan` currently runs
+Scout -> Librarian -> Triage -> Investigator and prints results; there is no
+Adjudicator yet, so it doesn't persist findings or render a final
+confirmed/rejected verdict.
 
 ## Environment
 
@@ -65,8 +68,14 @@ These are load-bearing for correctness and latency, not just tuning:
 5. Model kwargs go through `LiteLlm(model=f"ollama_chat/{MODEL}", num_ctx=...,
    num_gpu=..., think=...)` — note the `ollama_chat/` prefix, never
    `ollama/`.
+6. **`temperature` is the one kwarg that does NOT reliably reach Ollama as
+   a `LiteLlm(...)` constructor kwarg** — unlike num_gpu/num_ctx/think.
+   Verdicts varied run to run until temperature was set via ADK's own
+   `generate_content_config=GenerateContentConfig(temperature=0)` on the
+   `LlmAgent` instead. `DirectOllamaRunner` doesn't have this problem
+   (temperature goes straight into `options`).
 
-## Architecture (per PLAN.md — target design; Phase 2 on is not yet built)
+## Architecture (per PLAN.md — target design; Phase 7 on is not yet built)
 
 Two local agent missions share one Gemma 4 model (loaded once, prompts
 swapped against resident weights), one memory store, and one tool layer.
@@ -119,20 +128,25 @@ both `tools` and `output_schema`** — split into a tools-agent
 ## Commands
 
 CLI entry point is `omen/cli.py` (`asyncio.run(main())`, per PLAN.md — ADK
-is async throughout). Working today (Phase 1): `seed`, `reindex`,
-`memory list`, `memory forget`. `scan`/`learn` land in later phases.
+is async throughout). Working today: `seed`, `reindex`, `memory list`,
+`memory forget`, `calibrate`, and `scan` (`--dry-run` Scout-only,
+`--retrieval-only` +Librarian, or the full Triage+Investigator pipeline;
+`--runner={adk,direct}` picks the RoleRunner). `omen learn` (Archivist)
+lands in Phase 8.
 
 ```
 .venv\Scripts\activate
 python -m omen.cli seed incidents.yaml
 python -m omen.cli reindex
-python -m omen.cli memory list
+python -m omen.cli scan <path>
 ```
 
-No test suite exists yet beyond empty stubs in `tests/`. Once populated per
-PLAN.md's phase plan:
+63 tests pass across `tests/` (some skip gracefully without a reachable
+Ollama — most of the suite needs live inference, not mocks, since prompt
+quality can't be verified any other way):
 
 ```
-pytest                      # full suite
-pytest tests/test_scout.py  # single test file
+pytest                          # full suite (~5-6 min; most tests hit the live model)
+pytest tests/test_scout.py      # single test file, fast, no model needed
+pytest tests/test_triage.py     # the fixture precision/recall gate
 ```

@@ -96,6 +96,28 @@ class TriageVerdict(BaseModel):
     reasoning: str
 
 
+class ToolCallStep(BaseModel):
+    """One tool round-trip in an Investigator transcript — also the shape
+    persisted to SQLite's `tool_calls` table, the audit trail PLAN.md
+    treats as the honest answer to "did the agent actually use tools?"."""
+
+    tool_name: str
+    args: dict = Field(default_factory=dict)
+    result: str
+    note: str | None = None  # e.g. a duplicate-call or cap notice from ToolBudget
+
+
+class Transcript(BaseModel):
+    """The Investigator's full trace for one chunk: every tool call plus
+    its final free-text summary. The Adjudicator (Phase 7) reads this —
+    blind to Triage's own reasoning and verdict — to reach a verdict with
+    the surrounding code in hand rather than re-guessing from one chunk."""
+
+    steps: list[ToolCallStep] = Field(default_factory=list)
+    final_text: str = ""
+    stopped_reason: Literal["model_finished", "call_cap", "wall_clock_cap"] = "model_finished"
+
+
 class AdjudicatorVerdict(BaseModel):
     verdict: Literal["confirmed", "unverified", "rejected"]
     code_mechanism: str

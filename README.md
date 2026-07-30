@@ -188,6 +188,59 @@ left to a prompt.
   update-by-ref against an isolated store, and all three ToolBudget caps
   plus a live search_memory/get_incident test (skips without Ollama).
 
+### Phase 6 results
+
+`prompts/triage.txt` and `prompts/investigator.txt`; `agents.py` (the
+only module that imports `google.adk`, exposing generic
+`run_structured_adk`/`run_tooled_adk`); `runners.py` (`RoleRunner`
+protocol, `ADKRoleRunner`, and a fully-implemented `DirectOllamaRunner` —
+not hypothetical insurance, both paths are tested equally). Wired into
+`omen scan`'s real pipeline (Triage on every gated chunk, Investigator on
+Triage positives), replacing the "not implemented" placeholder.
+
+- **End-to-end validation was clean on the first real run**: against a
+  planted true positive (`functools.lru_cache` on a permission check) and
+  a hard negative (a bare module-level dict, and a helper function with
+  no cache at all), Triage ruled MATCH/NO_MATCH/NO_MATCH correctly with
+  precise mechanism-first reasoning for all three, and the Investigator's
+  evidence-based summary on the one true positive correctly cited a
+  `grep_symbol("cache_clear")` search returning empty as evidence of no
+  invalidation path.
+- **Fixture set through Triage** (PLAN.md's Phase 6 acceptance item, and
+  also the Verification section's full-pipeline gate — "≥3/4 true
+  positives caught, ≤1/4 hard negatives flagged"): **4/4 true positives
+  caught, 0/4 hard negatives flagged, 0/4 unrelated flagged.** Pinned as
+  `tests/test_triage.py`.
+- **Determinism (temperature 0) needed a real fix, not just a config
+  value.** Passing `temperature=0` as a `LiteLlm` constructor kwarg
+  looked right (num_gpu/num_ctx/think all work that way) but didn't
+  reliably reach Ollama through the ADK -> LiteLLM chain — verdicts
+  varied slightly run to run. Setting it via ADK's own
+  `generate_content_config=GenerateContentConfig(temperature=0)` on the
+  `LlmAgent` fixed it: verdict and confidence are now stable across every
+  repeated run tested (a single one-off full-text divergence was seen
+  once outside that fix, consistent with known GPU floating-point
+  non-associativity under flash attention, not a plumbing issue).
+- **A real bug found and fixed**: the Investigator's returned
+  `final_text` initially included its entire raw chain-of-thought ramble
+  when `think=True`, because ADK's `genai.types.Part` marks thinking text
+  with a `thought: bool` flag that wasn't being checked. Fixed by
+  streaming thinking text live via `on_text` but excluding it from the
+  text returned to the caller — the Adjudicator (Phase 7) needs the
+  clean conclusion, not the scratch work.
+- Tool-call caps, streaming callbacks (`on_step`/`on_text`), and the
+  duplicate-call cache all verified working identically across both
+  runners, including a case where a test's own assertion (not the
+  implementation) was wrong: an adversarial prompt telling the model to
+  retry 3 times after a cap message caused 3 *attempts*, which is
+  correct model behavior — the property that actually matters (only one
+  attempt ever did real work) held throughout.
+- 12 new tests (63 total project-wide) across `tests/test_runners.py`
+  (parametrized across both runners: true-positive/hard-negative
+  structured judging, determinism, a live tooled investigation, and
+  call-cap enforcement) and `tests/test_triage.py` (the fixture
+  precision/recall gate).
+
 ## Setup
 
 ```
