@@ -17,16 +17,17 @@ The working directory on disk is still `Local-lore` (unrenamed — renaming an
 open project directory has its own risk and wasn't part of the code/docs
 rename).
 
-**Current state:** Phases 0-6 done (env verified; contracts/store/vectors;
+**Current state:** Phases 0-7 done (env verified; contracts/store/vectors;
 Scout; Librarian + `--retrieval-only`; fixtures/calibration GO/NO-GO passed;
-tools.py + ToolBudget; Triage + Investigator via both ADKRoleRunner and
-DirectOllamaRunner, wired into `omen scan`'s real pipeline — see README.md
-for details and acceptance results per phase). `archivist.py`, `sifter.py`,
-`report.py` and the Adjudicator (Phase 7 on) are still empty/unbuilt — don't
-assume those do something without checking. `omen scan` currently runs
-Scout -> Librarian -> Triage -> Investigator and prints results; there is no
-Adjudicator yet, so it doesn't persist findings or render a final
-confirmed/rejected verdict.
+tools.py + ToolBudget; Triage + Investigator + Adjudicator, all via both
+ADKRoleRunner and DirectOllamaRunner, wired into `omen scan`'s real
+pipeline — see README.md for details and acceptance results per phase).
+`archivist.py`, `sifter.py`, and `report.py` (Phase 8 on) are still
+empty/unbuilt — don't assume those do something without checking. `omen scan`
+currently runs Scout -> Librarian -> Triage -> Investigator -> Adjudicator
+and prints a final confirmed/unverified/rejected verdict with mechanism,
+reasoning, confidence, and evidence lines; there is no Scribe yet, so it
+doesn't persist findings to SQLite or render a markdown report.
 
 ## Environment
 

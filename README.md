@@ -241,6 +241,47 @@ Triage positives), replacing the "not implemented" placeholder.
   call-cap enforcement) and `tests/test_triage.py` (the fixture
   precision/recall gate).
 
+### Phase 7 results
+
+`prompts/adjudicator.txt` and the `AdjudicatorVerdict` schema (already
+present in `contracts.py` from Phase 1) wired into `omen scan`'s pipeline
+as the final stage after the Investigator: chunk + candidate incidents +
+investigation transcript in, `confirmed` / `unverified` / `rejected` out.
+No new module — `agents.run_structured_adk` and both `RoleRunner`s were
+already generic over any `output_schema`, so the Adjudicator is a prompt
+file plus a prompt-assembly function and one loop step in `cli.py`, not
+new plumbing.
+
+- **Adjudicator independence is enforced by construction, not convention.**
+  `_format_adjudicator_prompt(conn, chunk, candidates, transcript)` takes
+  no `TriageVerdict` parameter at all — there is nothing to accidentally
+  leak. `tests/test_adjudicator.py::test_adjudicator_prompt_is_blind_to_triage`
+  builds a `TriageVerdict` with a distinctive reasoning string and its
+  literal `"MATCH"` verdict, asserts neither appears in the assembled
+  prompt, and only then checks the transcript/candidate context that
+  *should* be there survived.
+- **Empty `evidence_lines` on a `confirmed` verdict is downgraded to
+  `unverified` in code** (`_finalize_adjudicator_verdict`), never left to
+  the model's discretion — covered by a pure unit test, no model needed.
+- **Fixture precision held, not just "improved or held."** Re-running the
+  Phase 6 true-positive (`functools.lru_cache` permission check) and hard-
+  negative (`cachetools.TTLCache` thumbnail cache) pair all the way through
+  Triage -> Investigator -> Adjudicator: the true positive came back
+  `confirmed` with real `file:line` evidence citations from the
+  Investigator's transcript; the hard negative's Investigator correctly
+  found no authorization check anywhere in the file and the Adjudicator
+  ruled it non-`confirmed` on that evidence. Pinned as
+  `tests/test_adjudicator.py::test_adjudicator_end_to_end`
+  (parametrized, live Ollama, skips gracefully without it).
+- 6 new tests (69 total project-wide) in `tests/test_adjudicator.py`.
+
+`omen scan`'s real pipeline is now Scout -> Librarian -> Triage ->
+Investigator -> Adjudicator end to end, printing a final verdict with
+mechanism, reasoning, confidence, and evidence lines for every
+Triage-positive chunk. Persistence to `findings`/`runs` (the Scribe) is
+still Phase 9 — the pipeline prints its verdict but doesn't yet write it
+to SQLite.
+
 ## Setup
 
 ```

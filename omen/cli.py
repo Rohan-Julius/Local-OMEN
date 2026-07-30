@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from omen import agents, config, fixtures as fixtures_mod, librarian, runners, scout, store, tools as tools_mod, vectors
-from omen.contracts import GatedChunk, RetrievalCandidate, TriageVerdict
+from omen.contracts import AdjudicatorVerdict, GatedChunk, RetrievalCandidate, Transcript, TriageVerdict
 
 # Windows consoles default to a legacy codepage that mangles em-dashes and
 # other non-ASCII content living in incident/postmortem text (renders as
@@ -62,13 +62,8 @@ def _print_chunk_table(chunks) -> None:
         print(f"{c.file_path:40}  {c.symbol:{symbol_width}}  {span:>9}  {c.content_hash[:8]}")
 
 
-def _format_triage_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> str:
-    lines = [
-        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):",
-        chunk.content,
-        "",
-        "CANDIDATE INCIDENTS:",
-    ]
+def _format_candidate_block(conn, candidates: list[RetrievalCandidate]) -> list[str]:
+    lines = ["CANDIDATE INCIDENTS:"]
     for cand in candidates:
         incident = store.get_incident(conn, cand.incident_ref)
         if incident is None:
@@ -76,6 +71,16 @@ def _format_triage_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> 
         lines.append(f"{incident.ref}: {incident.title}")
         lines.append(f"  failure_mechanism: {incident.failure_mechanism}")
         lines.append(f"  the_rule: {incident.the_rule}")
+    return lines
+
+
+def _format_triage_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> str:
+    lines = [
+        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):",
+        chunk.content,
+        "",
+    ]
+    lines += _format_candidate_block(conn, candidates)
     return "\n".join(lines)
 
 
@@ -90,10 +95,45 @@ def _format_investigator_prompt(chunk, verdict: TriageVerdict, candidates: list[
     )
 
 
+def _format_adjudicator_prompt(conn, chunk, candidates: list[RetrievalCandidate], transcript: Transcript) -> str:
+    """Deliberately built from `chunk`, `candidates`, and `transcript` alone
+    — never from the TriageVerdict — so the Adjudicator stays blind to
+    Triage's reasoning and verdict (PLAN.md Phase 7 / Verification:
+    "Adjudicator independence")."""
+    lines = [
+        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):",
+        chunk.content,
+        "",
+    ]
+    lines += _format_candidate_block(conn, candidates)
+    lines.append("")
+    lines.append("INVESTIGATION TRANSCRIPT:")
+    if transcript.steps:
+        for i, step in enumerate(transcript.steps, 1):
+            lines.append(f"  [{i}] {step.tool_name}({step.args}) -> {step.result}")
+            if step.note:
+                lines.append(f"      note: {step.note}")
+    else:
+        lines.append("  (no tool calls)")
+    lines.append("")
+    lines.append("INVESTIGATOR'S SUMMARY:")
+    lines.append(transcript.final_text or "(no summary — the investigation stopped before concluding)")
+    return "\n".join(lines)
+
+
+def _finalize_adjudicator_verdict(verdict: AdjudicatorVerdict) -> AdjudicatorVerdict:
+    """PLAN.md Phase 7: "Empty evidence_lines on a positive -> auto-downgraded
+    in code" — never left to the model's discretion."""
+    if verdict.verdict == "confirmed" and not verdict.evidence_lines:
+        return verdict.model_copy(update={"verdict": "unverified"})
+    return verdict
+
+
 async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Path, gated: list[GatedChunk]) -> None:
     runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
     triage_instruction = agents.load_prompt("triage.txt")
     investigator_instruction = agents.load_prompt("investigator.txt")
+    adjudicator_instruction = agents.load_prompt("adjudicator.txt")
 
     for gc in gated:
         c = gc.chunk
@@ -129,6 +169,21 @@ async def _triage_and_investigate(args: argparse.Namespace, conn, repo_path: Pat
         )
         print(f"  [investigator] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
         print(f"  [investigator] summary: {transcript.final_text}")
+
+        print("  [adjudicator] adjudicating...")
+        adjudicator_prompt = _format_adjudicator_prompt(conn, c, gc.candidates, transcript)
+        raw_adj_verdict = await runner.run_structured(
+            adjudicator_instruction, adjudicator_prompt, AdjudicatorVerdict, think=config.THINK_DEFAULT
+        )
+        adj_verdict = _finalize_adjudicator_verdict(raw_adj_verdict)
+        downgrade_note = (
+            "  (downgraded: confirmed with no evidence_lines)" if adj_verdict.verdict != raw_adj_verdict.verdict else ""
+        )
+        print(f"  [adjudicator] verdict={adj_verdict.verdict}{downgrade_note}  confidence={adj_verdict.confidence}")
+        print(f"  [adjudicator] mechanism: {adj_verdict.code_mechanism}")
+        print(f"  [adjudicator] reasoning: {adj_verdict.reasoning}")
+        for line in adj_verdict.evidence_lines:
+            print(f"  [adjudicator] evidence: {line}")
 
 
 async def cmd_scan(args: argparse.Namespace) -> None:
