@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,7 +24,7 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 import chromadb  # noqa: E402 - must follow the telemetry env var above
 from chromadb.config import Settings  # noqa: E402
 
-from omen import config  # noqa: E402
+from omen import config, errors  # noqa: E402
 from omen.config import CHROMA_COLLECTION, EMBED_MODEL  # noqa: E402
 from omen.contracts import Incident  # noqa: E402
 
@@ -46,8 +47,15 @@ def _embed(prompts: list[str]) -> list[list[float]]:
     req = urllib.request.Request(
         f"{config.OLLAMA_HOST}/api/embed", data=body, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # Ollama answers 404 for a model that is not pulled
+            raise errors.ModelMissing(EMBED_MODEL) from e
+        raise
+    except urllib.error.URLError as e:
+        raise errors.OllamaUnavailable() from e
     return data["embeddings"]
 
 
@@ -167,16 +175,27 @@ def delete_incident_variants(ref: str) -> None:
     get_collection().delete(where={"incident_ref": ref})
 
 
+def query_chunks(embeddings: list[list[float]], n_results: int = 6) -> list[list[dict]]:
+    """Query with many chunk embeddings in ONE Chroma call (production plan
+    Phase 5: one query for a whole scan, not one per chunk). Returns, per
+    embedding and in order, hits with `similarity` already converted from
+    Chroma's raw cosine distance (PLAN.md: "convert once at the vectors.py
+    boundary so no threshold logic downstream sees a raw distance") —
+    callers never see `distance`."""
+    if not embeddings:
+        return []
+    res = get_collection().query(query_embeddings=embeddings, n_results=n_results)
+    all_hits = []
+    for ids, dists, metas, docs in zip(res["ids"], res["distances"], res["metadatas"], res["documents"]):
+        all_hits.append(
+            [
+                {"id": id_, "similarity": 1.0 - dist, "metadata": meta, "document": doc}
+                for id_, dist, meta, doc in zip(ids, dists, metas, docs)
+            ]
+        )
+    return all_hits
+
+
 def query_chunk(embedding: list[float], n_results: int = 6) -> list[dict]:
-    """Query with a chunk embedding. Returns hits with `similarity` already
-    converted from Chroma's raw cosine distance (PLAN.md: "convert once at
-    the vectors.py boundary so no threshold logic downstream sees a raw
-    distance") — callers never see `distance`."""
-    col = get_collection()
-    res = col.query(query_embeddings=[embedding], n_results=n_results)
-    hits = []
-    for id_, dist, meta, doc in zip(
-        res["ids"][0], res["distances"][0], res["metadatas"][0], res["documents"][0]
-    ):
-        hits.append({"id": id_, "similarity": 1.0 - dist, "metadata": meta, "document": doc})
-    return hits
+    """Query with one chunk embedding (see `query_chunks`)."""
+    return query_chunks([embedding], n_results=n_results)[0]

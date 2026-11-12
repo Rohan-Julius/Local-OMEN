@@ -6,9 +6,10 @@ without this file changing shape.
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
 import os
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from pydantic import BaseModel
 
@@ -70,6 +71,12 @@ async def run_structured_adk(
     return schema.model_validate(raw)
 
 
+class TooledResult(NamedTuple):
+    final_text: str
+    hit_llm_call_limit: bool  # ADK's own max_llm_calls safety net cut the loop
+    llm_timed_out: bool  # one model turn exceeded `llm_timeout`
+
+
 async def run_tooled_adk(
     instruction: str,
     prompt: str,
@@ -77,20 +84,29 @@ async def run_tooled_adk(
     max_llm_calls: int,
     think: bool = True,
     on_text: Callable[[str], None] | None = None,
-) -> tuple[str, bool]:
+    llm_timeout: float | None = None,
+) -> TooledResult:
     """Drives the ADK agent loop to completion and returns its final
-    free-text answer, and whether ADK's own `max_llm_calls` safety net cut
-    the loop (so the caller can report a call cap, audit B13).
- Tool-call bookkeeping (caps/dedup/transcript) is
-    already baked into `tools` by tools.budgeted_tools() before this is
-    called — this function only drives ADK's side of the loop.
+    free-text answer, whether ADK's own `max_llm_calls` safety net cut the
+    loop (so the caller can report a call cap, audit B13), and whether a
+    model turn timed out.
+
+    Tool-call bookkeeping (caps/dedup/transcript) is already baked into
+    `tools` by tools.budgeted_tools() before this is called — this
+    function only drives ADK's side of the loop.
+
+    `llm_timeout` (seconds, None = no limit) bounds the wait for each next
+    event. ADK emits an event when a model response arrives and again when
+    a tool result does, so the wait is one model turn plus, at most, one
+    tool call (tools take milliseconds). On timeout the loop is cancelled
+    and the result says so (audit B5, part 2). Cancelling is clean here:
+    the waiting call is an awaited HTTP request, unlike the Direct
+    runner's worker thread.
 
     `max_llm_calls` is ADK's own hard safety net, set by the caller a few
     calls above our own ToolBudget's cap — belt and braces, per PLAN.md,
     in case the model ignores our budget's stop-and-answer message
-    entirely (Phase 0 showed this can happen with an unsatisfying tool
-    response; it should not happen once the response is a clear
-    instruction, but the outer net stays regardless).
+    entirely.
     """
     agent = LlmAgent(
         name="tooled_role",
@@ -107,10 +123,20 @@ async def run_tooled_adk(
 
     final_text_parts: list[str] = []
     hit_llm_call_limit = False
+    llm_timed_out = False
+    events = runner.run_async(user_id=_APP_NAME, session_id=session.id, new_message=content, run_config=run_config)
     try:
-        async for event in runner.run_async(
-            user_id=_APP_NAME, session_id=session.id, new_message=content, run_config=run_config
-        ):
+        while True:
+            try:
+                event = await asyncio.wait_for(events.__anext__(), llm_timeout)
+            except StopAsyncIteration:
+                break
+            except (asyncio.TimeoutError, TimeoutError):
+                llm_timed_out = True
+                break
+            except LlmCallsLimitExceededError:
+                hit_llm_call_limit = True  # the outer safety net fired
+                break
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     text = getattr(part, "text", None)
@@ -124,7 +150,12 @@ async def run_tooled_adk(
                     # reads as the investigation's clean conclusion.
                     if not getattr(part, "thought", False):
                         final_text_parts.append(text)
-    except LlmCallsLimitExceededError:
-        hit_llm_call_limit = True  # the outer safety net fired
+    finally:
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # closing a cancelled generator can complain; the result is already decided
+                pass
 
-    return "".join(final_text_parts).strip(), hit_llm_call_limit
+    return TooledResult("".join(final_text_parts).strip(), hit_llm_call_limit, llm_timed_out)

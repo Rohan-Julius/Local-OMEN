@@ -82,7 +82,7 @@ def test_old_database_upgrades_in_place_without_losing_rows(tmp_path, with_meta)
 
     conn = store.connect(db)
 
-    assert store.schema_version(conn) == store.SCHEMA_VERSION == 3
+    assert store.schema_version(conn) == store.SCHEMA_VERSION == 4
     assert {"note"} <= _columns(conn, "tool_calls")
     assert {"ms_scout", "ms_adjudicate", "n_written"} <= _columns(conn, "runs")
     assert {"downgrade_reason", "stopped_reason"} <= _columns(conn, "findings")
@@ -99,7 +99,7 @@ def test_old_database_upgrades_in_place_without_losing_rows(tmp_path, with_meta)
 
     # A second connect is a no-op: nothing re-applied, nothing lost.
     conn = store.connect(db)
-    assert store.schema_version(conn) == 3
+    assert store.schema_version(conn) == 4
     assert _counts(conn)["findings"] == 1
 
 
@@ -147,13 +147,13 @@ def _make_v2_db(path):
     conn.close()
 
 
-def test_version_2_database_upgrades_to_3_without_losing_rows(tmp_path):
+def test_version_2_database_upgrades_to_latest_without_losing_rows(tmp_path):
     db = tmp_path / "v2.db"
     _make_v2_db(db)
 
     conn = store.connect(db)
 
-    assert store.schema_version(conn) == 3
+    assert store.schema_version(conn) == 4
     assert _counts(conn) == {
         "incidents": 1, "surface_forms": 2, "chunk_vectors": 1, "runs": 1, "findings": 1, "tool_calls": 1,
     }
@@ -193,5 +193,75 @@ def test_a_failing_version_3_migration_rolls_back_cleanly(tmp_path, monkeypatch)
     raw.close()
 
     monkeypatch.undo()  # with the real migrations the database upgrades fine afterwards
-    assert store.schema_version(store.connect(db)) == 3
+    assert store.schema_version(store.connect(db)) == 4
 
+
+
+# ---------------------------------------------------------------------------
+# Version 3 -> 4 (Phase 5): skipped_chunks and runs.n_skipped
+# ---------------------------------------------------------------------------
+
+
+def _make_v3_db(path):
+    real = store.MIGRATIONS
+    store.MIGRATIONS = [m for m in real if m[0] <= 3]
+    try:
+        conn = store.connect(path)
+    finally:
+        store.MIGRATIONS = real
+    conn.executescript(OLD_ROWS)
+    conn.execute("INSERT INTO incident_history (ref, version, action, snapshot) VALUES ('OMEN-001', 1, 'create', '{}')")
+    conn.commit()
+    assert store.schema_version(conn) == 3
+    conn.close()
+
+
+def test_version_3_database_upgrades_to_4_without_losing_rows(tmp_path):
+    db = tmp_path / "v3.db"
+    _make_v3_db(db)
+
+    conn = store.connect(db)
+
+    assert store.schema_version(conn) == 4
+    assert "n_skipped" in _columns(conn, "runs")
+    assert {"run_id", "file_path", "start_line", "end_line", "symbol", "incident_ref", "similarity",
+            "triage_verdict", "stage", "reason"} <= _columns(conn, "skipped_chunks")
+    assert _counts(conn)["runs"] == 1 and _counts(conn)["findings"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM incident_history").fetchone()[0] == 1  # Phase 4 data untouched
+    assert conn.execute("SELECT n_skipped FROM runs").fetchone()[0] is None  # runs made before v4 have no count
+    # and the new table is usable, with its foreign key to runs enforced
+    store.record_skipped_chunk(conn, SimpleSkipped(run_id="r1"))
+    assert conn.execute("SELECT COUNT(*) FROM skipped_chunks").fetchone()[0] == 1
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_skipped_chunk(conn, SimpleSkipped(run_id="no-such-run"))
+
+
+class SimpleSkipped:
+    def __init__(self, run_id):
+        self.run_id, self.file_path, self.start_line, self.end_line = run_id, "a.py", 1, 2
+        self.symbol, self.incident_ref, self.similarity = "f", "OMEN-001", 0.5
+        self.triage_verdict, self.stage, self.reason = None, "triage", "not triaged: --max-gated 1 reached"
+
+
+def test_a_failing_version_4_migration_rolls_back_cleanly(tmp_path, monkeypatch):
+    db = tmp_path / "v3.db"
+    _make_v3_db(db)
+    good = [m for m in store.MIGRATIONS if m[0] <= 3]
+    broken_4 = (4, [
+        "CREATE TABLE skipped_chunks (id INTEGER PRIMARY KEY, run_id TEXT)",
+        "ALTER TABLE no_such_table ADD COLUMN x TEXT",
+    ])
+    monkeypatch.setattr(store, "MIGRATIONS", [*good, broken_4])
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.connect(db)
+
+    raw = sqlite3.connect(db)
+    raw.row_factory = sqlite3.Row
+    assert not raw.execute("SELECT name FROM sqlite_master WHERE name = 'skipped_chunks'").fetchall()
+    assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "3"
+    assert raw.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    raw.close()
+
+    monkeypatch.undo()
+    assert store.schema_version(store.connect(db)) == 4

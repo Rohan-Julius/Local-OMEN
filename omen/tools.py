@@ -19,8 +19,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from omen import config, librarian, scout, store, vectors
-from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, TOOL_WALL_CLOCK_SECONDS
+from omen import config, librarian, profiles, scout, store, vectors
+from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX
 from omen.contracts import IncidentSeed, ToolCallStep
 
 # ---------------------------------------------------------------------------
@@ -390,17 +390,32 @@ class ToolBudget:
     instead of re-executing), and a wall-clock ceiling. All three checked
     here, never left to a prompt asking the model to behave.
 
-    The wall clock starts at the first tool call, not at construction.
-    Starting it at construction counted the first model turn too, and on
-    slow (CPU) hardware that turn alone used up the whole budget, so the
-    first tool call was refused (audit B5). Generation time before the
-    first call needs its own timeout (production plan, Phase 5).
-    `wall_clock_seconds` and `max_calls` are constructor arguments with
-    the config.py values as defaults."""
+    Two time limits, neither of which is a per-generation timeout (that
+    lives in the runners, see profiles.py), so model generation time no
+    longer causes a tool call to be refused (audit B5, parts 1 and 2):
 
-    def __init__(self, max_calls: int = MAX_TOOL_CALLS, wall_clock_seconds: float = TOOL_WALL_CLOCK_SECONDS):
+    - `tool_seconds`: the total time spent INSIDE tools. Tools take
+      milliseconds (search_memory ~5 s on CPU), so this is a generous cap.
+    - `wall_clock_seconds`: the overall deadline of the investigation,
+      model turns included, measured from the first tool call (so the
+      first model turn is not charged to it; the runner's LLM timeout
+      bounds that turn). It is much larger than before and depends on the
+      profile.
+
+    Both default to the active profile's values (profiles.active()).
+    `max_calls` defaults to config.MAX_TOOL_CALLS."""
+
+    def __init__(
+        self,
+        max_calls: int = MAX_TOOL_CALLS,
+        wall_clock_seconds: float | None = None,
+        tool_seconds: float | None = None,
+    ):
+        profile = profiles.active()
         self.max_calls = max_calls
-        self.wall_clock_seconds = wall_clock_seconds
+        self.wall_clock_seconds = profile.deadline_seconds if wall_clock_seconds is None else wall_clock_seconds
+        self.tool_seconds = profile.tool_seconds if tool_seconds is None else tool_seconds
+        self._tool_time = 0.0
         self._start: float | None = None
         self._count = 0
         self._cache: dict[tuple, object] = {}
@@ -439,6 +454,9 @@ class ToolBudget:
         if self.elapsed_seconds() > self.wall_clock_seconds:
             self.record_event("wall_clock_cap")
             return False, None, "wall-clock ceiling exceeded - stop calling tools and answer now"
+        if self._tool_time > self.tool_seconds:
+            self.record_event("wall_clock_cap")
+            return False, None, "tool-time ceiling exceeded - stop calling tools and answer now"
         if self._count >= self.max_calls:
             self.record_event("call_cap")
             return False, None, f"max {self.max_calls} tool calls exceeded - stop calling tools and answer now"
@@ -453,12 +471,14 @@ class ToolBudget:
             return False, None, f"unknown tool {tool_name!r}"
 
         note = None
+        tool_start = time.monotonic()
         try:
             result = tools[tool_name](**kwargs)
         except (PathEscapesRoot, PathDenied) as e:
             result, note = f"error: {e}", "error"
         except Exception as e:
             result, note = f"error: {type(e).__name__}: {e}", "error"
+        self._tool_time += time.monotonic() - tool_start
         if note == "error":
             self.record_event("error")
 

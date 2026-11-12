@@ -16,8 +16,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-from omen import prompts, tools as tools_mod
-from omen.config import ARCHIVIST_THINK_DEFAULT
+from omen import profiles, prompts, tools as tools_mod
 from omen.contracts import Transcript
 from omen.tools import ToolBudget
 
@@ -35,7 +34,8 @@ async def learn_from_postmortem(
     conn: sqlite3.Connection,
     allowed_root: Path,
     postmortem_path: str,
-    think: bool = ARCHIVIST_THINK_DEFAULT,
+    think: bool | None = None,
+    budget: ToolBudget | None = None,
     on_step: Callable | None = None,
     on_text: Callable[[str], None] | None = None,
     source: str | None = None,
@@ -52,7 +52,8 @@ async def learn_from_postmortem(
     learn_tools = tools_mod.build_learn_postmortem_tools(
         conn, allowed_root, source=source or f"postmortem:{postmortem_path}"
     )
-    budget = ToolBudget()
+    budget = budget or ToolBudget()
+    think = profiles.active().archivist_think if think is None else think
     prompt = _build_postmortem_prompt(postmortem_path)
     return await runner.run_tooled(instruction, prompt, learn_tools, budget, think=think, on_step=on_step, on_text=on_text)
 
@@ -71,7 +72,8 @@ async def learn_from_commit(
     conn: sqlite3.Connection,
     repo_root: Path,
     sha: str,
-    think: bool = ARCHIVIST_THINK_DEFAULT,
+    think: bool | None = None,
+    budget: ToolBudget | None = None,
     on_step: Callable | None = None,
     on_text: Callable[[str], None] | None = None,
 ) -> Transcript:
@@ -83,7 +85,8 @@ async def learn_from_commit(
     differ."""
     instruction = prompts.load_prompt("archivist_git.txt")
     learn_tools = tools_mod.build_learn_git_tools(conn, repo_root, source=f"git:{sha}")
-    budget = ToolBudget()
+    budget = budget or ToolBudget()
+    think = profiles.active().archivist_think if think is None else think
     prompt = _build_git_prompt(sha)
     return await runner.run_tooled(instruction, prompt, learn_tools, budget, think=think, on_step=on_step, on_text=on_text)
 

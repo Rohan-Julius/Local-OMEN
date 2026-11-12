@@ -102,9 +102,13 @@ async def test_run_tooled_produces_a_sensible_transcript(tmp_path, runner_cls):
     runner = runner_cls()
     transcript = await runner.run_tooled(INVESTIGATOR_INSTRUCTION, prompt, scan_tools, budget, think=False)
 
-    assert transcript.final_text != ""
-    assert transcript.stopped_reason == "model_finished"
-    assert len(transcript.steps) > 0
+    detail = (
+        f"stopped_reason={transcript.stopped_reason} note={transcript.note} "
+        f"events={budget.events} steps={[(s.tool_name, s.note) for s in transcript.steps]}"
+    )
+    assert transcript.final_text != "", detail
+    assert transcript.stopped_reason == "model_finished", detail
+    assert len(transcript.steps) > 0, detail
     # the model should actually have looked at the code, not just guessed
     tool_names_used = {s.tool_name for s in transcript.steps}
     assert tool_names_used & {"read_code", "grep_symbol", "get_incident", "search_memory"}

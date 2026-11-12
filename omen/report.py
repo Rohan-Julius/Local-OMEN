@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
-from omen.contracts import Finding
+from omen.contracts import Finding, SkippedChunk
 
 
 class Stopwatch:
@@ -57,6 +57,7 @@ class ScanStats:
     ms_investigate: int = 0
     ms_adjudicate: int = 0
     ms_total: int = 0  # wall clock for the whole command, Scout included (audit B14)
+    skipped: list = field(default_factory=list)  # list[SkippedChunk]: cap-skipped chunks
 
     def as_run_fields(self) -> dict:
         return {
@@ -74,7 +75,21 @@ class ScanStats:
             "ms_investigate": self.ms_investigate,
             "ms_adjudicate": self.ms_adjudicate,
             "ms_total": self.ms_total,
+            "n_skipped": len(self.skipped),
         }
+
+
+def print_skipped(skipped: list[SkippedChunk]) -> None:
+    """Chunks a cap kept from being triaged or investigated. They are stored
+    in `skipped_chunks` too: a cap must never hide a candidate."""
+    triage = [s for s in skipped if s.stage == "triage"]
+    investigation = [s for s in skipped if s.stage == "investigation"]
+    print(f"skipped {len(skipped)} chunk(s) because of caps (stored in `skipped_chunks`, raise the cap to process them):")
+    for label, group in (("not triaged", triage), ("Triage-positive, not investigated", investigation)):
+        if group:
+            print(f"  {label}: {len(group)}")
+            for s in group:
+                print(f"    {s.file_path}:{s.symbol or '?'}  similarity={s.similarity:.3f}  {s.reason}")
 
 
 def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
@@ -89,6 +104,9 @@ def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
         f"triage {stats.ms_triage / 1000:.1f}s  investigate {stats.ms_investigate / 1000:.1f}s  "
         f"adjudicate {stats.ms_adjudicate / 1000:.1f}s"
     )
+
+    if stats.skipped:
+        print_skipped(stats.skipped)
 
     if not findings:
         print("no findings.")

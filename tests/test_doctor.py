@@ -277,7 +277,9 @@ async def test_revert_with_ollama_down_keeps_the_ledger_and_points_at_doctor(cli
     capsys.readouterr()
     assert await run("memory", "revert", "OMEN-001") == cli.EXIT_RUNTIME_ERROR
     captured = capsys.readouterr()
-    assert "omen doctor --fix" in captured.out and "ConnectionError" in captured.err
+    assert "omen doctor --fix" in captured.out
+    # the raw ConnectionError becomes the one-line "Ollama is not reachable" message
+    assert "Ollama is not reachable at" in captured.err and "ollama serve" in captured.err
     assert store.get_incident(store.connect(store_dir / "omen.db"), "OMEN-001") is not None
 
 

@@ -27,9 +27,11 @@ from omen import (
     archivist,
     config,
     doctor as doctor_mod,
+    errors,
     evidence,
     fixtures as fixtures_mod,
     librarian,
+    profiles,
     prompts,
     report,
     scout,
@@ -37,12 +39,14 @@ from omen import (
     store,
     tools as tools_mod,
     vectors,
+    warmup,
 )
 from omen.contracts import (
     Finding,
     GatedChunk,
     RetrievalCandidate,
     RunRecord,
+    SkippedChunk,
     ToolCallRecord,
     Transcript,
     TriageVerdict,
@@ -183,6 +187,34 @@ def cmd_doctor(args: argparse.Namespace) -> int | None:
     return EXIT_OK if report_.ok else EXIT_USER_ERROR
 
 
+async def _prepare_llm(args: argparse.Namespace) -> profiles.Profile:
+    """Before a command's first real LLM call: one throwaway generation (with
+    one retry; audit B27, `--no-warmup` skips it), then pick the hardware
+    profile (`--profile` / OMEN_PROFILE / auto, which reads Ollama's
+    /api/ps and so needs the model loaded, hence after the warm-up) and make
+    it the active one for budgets, timeouts and `think`."""
+    if not getattr(args, "no_warmup", False):
+        seconds = await asyncio.to_thread(warmup.warm_up)
+        log.debug("warm-up call finished in %.1fs", seconds)
+    profile = profiles.resolve(getattr(args, "profile", None))
+    profiles.set_active(profile)
+    log.debug("%s", profile.describe())
+    return profile
+
+
+def _archivist_report(transcript: Transcript, ref: str | None, indent: str = "") -> None:
+    """What to print after an Archivist run. The model's own words are shown
+    only when a write really happened, and labelled as the model's note:
+    after a refused or failed write the model has been seen to claim it
+    recorded an incident anyway (Phase 4 diagnostic), and a summary that
+    sounds like success must not appear next to "No incident was written"."""
+    print(f"{indent}[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+    if transcript.note:
+        print(f"{indent}[archivist] note: {transcript.note}")
+    if ref and transcript.final_text:
+        print(f"{indent}[archivist] model's note: {transcript.final_text}")
+
+
 def _start_run(conn, mission: str, repo_path: Path, scope: str, runner: str) -> str:
     run_id = uuid.uuid4().hex[:12]
     store.start_run(
@@ -269,15 +301,14 @@ async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> int |
         )
         fields["n_investigated"] = 1
         fields["n_tool_calls"] = len(transcript.steps)
-        print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
-        print(f"[archivist] summary: {transcript.final_text}")
 
         ref = archivist.written_ref(transcript)
+        _archivist_report(transcript, ref)
         if ref:
             fields["n_written"] = 1
             print(f"Learned/updated {ref}. Run `omen memory forget {ref}` to undo.")
         else:
-            print("No incident was written.")
+            print(f"No incident was written ({transcript.stopped_reason}).")
     finally:
         ms = round((time.perf_counter() - start) * 1000)
         store.finish_run(conn, run_id, ms_investigate=ms, ms_total=ms, **fields)
@@ -314,14 +345,13 @@ async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> int | None:
                 )
             fields["n_investigated"] += 1
             fields["n_tool_calls"] += len(transcript.steps)
-            print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
-            print(f"[archivist] summary: {transcript.final_text}")
             ref = archivist.written_ref(transcript)
+            _archivist_report(transcript, ref)
             if ref:
                 print(f"  -> {ref}")
                 learned.append(ref)
             else:
-                print("  -> no incident written")
+                print(f"  -> no incident written ({transcript.stopped_reason})")
     finally:
         fields["n_written"] = len(learned)
         store.finish_run(
@@ -347,6 +377,8 @@ async def cmd_learn(args: argparse.Namespace) -> int | None:
         return _user_error(f"--repo {args.repo} is not a directory")
 
     conn = store.connect()
+    if not (args.from_git and args.dry_run):  # a dry run makes no LLM call
+        await _prepare_llm(args)
     runner = _make_runner(args.runner)
 
     if args.from_git:
@@ -445,6 +477,8 @@ async def _triage_and_investigate(
     run_id: str,
     stats: report.ScanStats,
 ) -> list[Finding]:
+    max_gated = getattr(args, "max_gated", config.MAX_GATED)
+    max_positives = getattr(args, "max_positives", config.MAX_POSITIVES)
     runner = _make_runner(args.runner)
     triage_instruction = prompts.load_prompt("triage.txt")
     investigator_instruction = prompts.load_prompt("investigator.txt")
@@ -455,7 +489,26 @@ async def _triage_and_investigate(
     adjudicate_watch = report.Stopwatch()
     findings: list[Finding] = []
 
-    for gc in gated:
+    def skip(gc: GatedChunk, stage: str, reason: str, triage_verdict: str | None = None) -> None:
+        """Record a chunk a cap kept from being processed: stored and shown
+        in the summary, never silently dropped."""
+        top = gc.candidates[0]
+        record = SkippedChunk(
+            run_id=run_id, file_path=gc.chunk.file_path, start_line=gc.chunk.start_line, end_line=gc.chunk.end_line,
+            symbol=gc.chunk.symbol, incident_ref=top.incident_ref, similarity=top.similarity,
+            triage_verdict=triage_verdict, stage=stage, reason=reason,
+        )
+        store.record_skipped_chunk(conn, record)
+        stats.skipped.append(record)
+
+    # Highest similarity first (each chunk's candidates are already sorted
+    # descending), so a cap keeps the most promising chunks.
+    ordered = sorted(gated, key=lambda g: g.candidates[0].similarity, reverse=True)
+    for gc in ordered[max_gated:]:
+        skip(gc, "triage", f"not triaged: --max-gated {max_gated} reached")
+    n_positives = 0
+
+    for gc in ordered[:max_gated]:
         c = gc.chunk
         print(f"\n=== {c.file_path}:{c.symbol} ({c.start_line}-{c.end_line}) ===")
         for cand in gc.candidates:
@@ -471,6 +524,12 @@ async def _triage_and_investigate(
 
         if verdict.verdict != "MATCH":
             continue
+
+        if n_positives >= max_positives:
+            print(f"  [investigator] skipped: --max-positives {max_positives} reached (still Triage-positive)")
+            skip(gc, "investigation", f"investigation skipped: cap (--max-positives {max_positives})", "MATCH")
+            continue
+        n_positives += 1
 
         print("  [investigator] investigating...")
         scan_tools = tools_mod.build_scan_tools(repo_path, conn)
@@ -488,11 +547,13 @@ async def _triage_and_investigate(
                 investigator_prompt,
                 scan_tools,
                 budget,
-                think=config.INVESTIGATOR_THINK_DEFAULT,
+                think=profiles.active().investigator_think,
                 on_step=on_step,
             )
         stats.n_investigated += 1
         print(f"  [investigator] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+        if transcript.note:
+            print(f"  [investigator] note: {transcript.note}")
         print(f"  [investigator] summary: {transcript.final_text}")
 
         print("  [adjudicator] adjudicating...")
@@ -544,6 +605,8 @@ async def _triage_and_investigate(
 async def cmd_scan(args: argparse.Namespace) -> int | None:
     if not Path(args.path).is_dir():
         return _user_error(f"{args.path} is not a directory")
+    if getattr(args, "max_gated", 0) < 0 or getattr(args, "max_positives", 0) < 0:
+        return _user_error("--max-gated and --max-positives must be 0 or more")
     if not args.dry_run and not store.list_incidents(store.connect()):
         # Nothing to match against: a scan cannot find anything, so say so
         # instead of embedding the code and recording an empty run.
@@ -579,6 +642,9 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
             for cand in gc.candidates:
                 print(f"    {cand.incident_ref}  {cand.similarity:.3f}  {cand.matched_variant}")
         return
+
+    if gated:  # nothing gated means no LLM call, so no warm-up either
+        await _prepare_llm(args)
 
     # --dry-run and --retrieval-only never reach here, so neither shows up
     # in `runs` — both are explicitly no-generation previews, not scans.
@@ -671,6 +737,13 @@ def _add_global_options(parser: argparse.ArgumentParser, suppress: bool) -> None
         "--store",
         default=default,
         help="Store directory (default: $OMEN_HOME, else ./omen_store)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=profiles.PROFILE_NAMES,
+        default=default,
+        help="Hardware profile: gpu, cpu, or auto (default: $OMEN_PROFILE, else auto = ask Ollama's /api/ps). "
+        "cpu turns think off and uses much longer timeouts.",
     )
     noise = parser.add_mutually_exclusive_group()
     noise.add_argument("-v", "--verbose", action="store_true", default=flag_default, help="Show debug diagnostics")
@@ -773,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="adk",
         help="adk (default) or direct — the reversibility hedge if ADK's tool path is flaky",
     )
+    p_learn.add_argument("--no-warmup", action="store_true", help="Skip the throwaway warm-up generation before the first LLM call")
     p_learn.set_defaults(func=cmd_learn)
 
     p_scan = sub.add_parser("scan", help="Investigate a codebase against the incident ledger")
@@ -791,6 +865,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="adk",
         help="adk (default) or direct — the reversibility hedge if ADK's schema or tool path is flaky",
     )
+    p_scan.add_argument(
+        "--max-gated",
+        type=int,
+        default=config.MAX_GATED,
+        metavar="N",
+        help=f"Send at most N gated chunks (highest similarity first) to Triage; the rest are reported and stored (default {config.MAX_GATED})",
+    )
+    p_scan.add_argument(
+        "--max-positives",
+        type=int,
+        default=config.MAX_POSITIVES,
+        metavar="N",
+        help=f"Investigate at most N Triage-positive chunks; the rest are reported and stored as Triage-positive (default {config.MAX_POSITIVES})",
+    )
+    p_scan.add_argument("--no-warmup", action="store_true", help="Skip the throwaway warm-up generation before the first LLM call")
     p_scan.set_defaults(func=cmd_scan)
 
     p_calibrate = sub.add_parser("calibrate", help="Sweep the similarity floor over fixtures/fixtures.yaml")
@@ -827,6 +916,11 @@ async def main(argv: list[str] | None = None) -> int:
         parser.error("argument -q/--quiet: not allowed with argument -v/--verbose")
     command = " ".join(filter(None, [args.command, getattr(args, "memory_command", None)]))
     _configure_logging(args.verbose, args.quiet)
+    if args.command in ("scan", "learn"):
+        try:
+            profiles.requested_name(args.profile)  # a bad OMEN_PROFILE is a user error, up front
+        except ValueError as e:
+            return _user_error(str(e))
     if args.store:
         config.set_store_dir(args.store)
     log.debug("store: %s", config.STORE_DIR.resolve())
@@ -839,7 +933,8 @@ async def main(argv: list[str] | None = None) -> int:
             result = await result
     except Exception as e:  # runtime or model error: one line, not a traceback (B18)
         log.debug("traceback:", exc_info=True)
-        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        friendly = errors.classify(e)  # Ollama down, model missing, timeout, invalid reply: the message is the story
+        print(f"error: {friendly}" if friendly else f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return EXIT_RUNTIME_ERROR
     finally:
         log.debug("%s finished in %.2fs", command, time.perf_counter() - start)

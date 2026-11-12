@@ -110,9 +110,13 @@ def scan_env(tmp_path, monkeypatch):
         )
     vectors.reindex(store.list_incidents(conn))
 
-    async def run(runner) -> None:
+    async def run(runner, **ns) -> None:
         monkeypatch.setattr(runners, "ADKRoleRunner", lambda: runner)
-        args = argparse.Namespace(path=str(repo), since=None, all=False, dry_run=False, retrieval_only=False, runner="adk")
+        options = dict(
+            path=str(repo), since=None, all=False, dry_run=False, retrieval_only=False, runner="adk",
+            no_warmup=True, profile="gpu", max_gated=8, max_positives=2,
+        )
+        args = argparse.Namespace(**{**options, **ns})  # tests override e.g. the caps
         await cli.cmd_scan(args)
 
     return repo, conn, run

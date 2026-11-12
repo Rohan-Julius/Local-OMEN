@@ -99,6 +99,8 @@ REF_PREFIX = "OMEN"
 # these three caps are enforced in the orchestrator (tools.py's
 # ToolBudget), never merely requested in a prompt.
 MAX_TOOL_CALLS = 6
+# The GPU profile's per-investigation deadline (profiles.GPU). Other limits
+# (per-LLM-call timeout, tool-time cap, CPU values) live in profiles.py.
 TOOL_WALL_CLOCK_SECONDS = 90
 GREP_MAX_HITS = 50
 DIFF_LINE_CAP = 300
@@ -110,3 +112,8 @@ DIFF_LINE_CAP = 300
 # is the safety valve.
 MAX_COMMITS = 50
 MAX_LEARN = 5
+
+# omen scan (production plan Phase 5; PLAN.md caps). Chunks beyond these are
+# never silently dropped: they are reported and stored in `skipped_chunks`.
+MAX_GATED = 8  # chunks that go to Triage, highest similarity first
+MAX_POSITIVES = 2  # Triage-positive chunks that get an Investigator run

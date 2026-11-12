@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from omen import config, store, vectors
+from omen import config, profiles, store, vectors
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INCIDENTS_YAML = PROJECT_ROOT / "incidents.yaml"
@@ -65,6 +65,33 @@ def _isolated_default_store(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(config, "STORE_DIR", default)
     monkeypatch.setattr(config, "DB_PATH", default / "omen.db")
     monkeypatch.setattr(config, "CHROMA_PATH", default / "chroma")
+
+
+@pytest.fixture(autouse=True)
+def _unit_tests_never_reach_ollama(request, monkeypatch):
+    """A test not marked `live` must not construct a real Ollama client or
+    probe /api/ps by accident: that made unit tests slow locally and would
+    fail in CI, where there is no Ollama. Tests that need a client pass a
+    fake (or monkeypatch `ollama.Client` themselves, which overrides this)."""
+    if request.node.get_closest_marker("live"):
+        return
+    import ollama
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("a unit test (not marked live) tried to reach Ollama; pass a fake client or mark it live")
+
+    monkeypatch.setattr(ollama, "Client", _refuse)
+    monkeypatch.setattr(profiles, "probe_ps", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_profile():
+    """profiles.set_active is process-wide state (the CLI sets it); reset it
+    around every test so a test that resolves a profile cannot change the
+    limits another test sees. OMEN_PROFILE from the environment still applies."""
+    profiles.set_active(None)
+    yield
+    profiles.set_active(None)
 
 
 @pytest.fixture(scope="module")

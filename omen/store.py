@@ -122,6 +122,25 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE findings ADD COLUMN stopped_reason TEXT",
         ],
     ),
+    (
+        4,  # Phase 5: chunks skipped by --max-gated / --max-positives are stored, never dropped
+        [
+            """CREATE TABLE skipped_chunks (
+                 id             INTEGER PRIMARY KEY,
+                 run_id         TEXT NOT NULL REFERENCES runs(run_id),
+                 file_path      TEXT NOT NULL,
+                 start_line     INTEGER,
+                 end_line       INTEGER,
+                 symbol         TEXT,
+                 incident_ref   TEXT,
+                 similarity     REAL,
+                 triage_verdict TEXT,
+                 stage          TEXT NOT NULL,
+                 reason         TEXT NOT NULL
+               )""",
+            "ALTER TABLE runs ADD COLUMN n_skipped INTEGER",
+        ],
+    ),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -604,6 +623,22 @@ def record_finding(conn: sqlite3.Connection, finding) -> int:
             finding.similarity, finding.verdict, finding.code_mechanism,
             finding.reasoning, finding.evidence, finding.confidence,
             finding.tool_calls, finding.downgrade_reason, finding.stopped_reason,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def record_skipped_chunk(conn: sqlite3.Connection, skipped) -> int:
+    cur = conn.execute(
+        """INSERT INTO skipped_chunks
+           (run_id, file_path, start_line, end_line, symbol, incident_ref,
+            similarity, triage_verdict, stage, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            skipped.run_id, skipped.file_path, skipped.start_line, skipped.end_line,
+            skipped.symbol, skipped.incident_ref, skipped.similarity,
+            skipped.triage_verdict, skipped.stage, skipped.reason,
         ),
     )
     conn.commit()

@@ -25,6 +25,8 @@ def _base_args(**overrides) -> argparse.Namespace:
         max_learn=5,
         dry_run=False,
         runner="adk",
+        no_warmup=True,  # fake runners: no Ollama call, no warm-up
+        profile="gpu",
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -152,7 +154,7 @@ async def test_b10_failed_write_incident_reports_no_incident_written(learn_sandb
     await cli.cmd_learn(_base_args(postmortem_path="postmortems/incident.md"))
 
     out = capsys.readouterr().out
-    assert "No incident was written." in out
+    assert "No incident was written (model_finished)." in out
     assert "Learned/updated" not in out
 
 

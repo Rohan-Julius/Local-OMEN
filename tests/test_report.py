@@ -41,7 +41,7 @@ def test_scan_stats_as_run_fields_matches_runs_columns(tmp_path):
     expected_keys = {
         "n_files", "n_chunks", "n_cache_hits", "n_gated", "n_triaged", "n_investigated",
         "n_tool_calls", "n_confirmed", "ms_scout", "ms_embed", "ms_triage", "ms_investigate",
-        "ms_adjudicate", "ms_total",
+        "ms_adjudicate", "ms_total", "n_skipped",
     }
     assert set(fields) == expected_keys
     # every field is a real `runs` column (after migrations), so finish_run cannot fail on it
@@ -125,7 +125,11 @@ def _fake_embeddings(monkeypatch) -> None:
 
 
 def _scan_args(path: str) -> argparse.Namespace:
-    return argparse.Namespace(path=path, since=None, all=False, dry_run=False, retrieval_only=False, runner="adk")
+    # no_warmup/profile: these tests use a fake runner, so no Ollama call (and no profile probe) may happen
+    return argparse.Namespace(
+        path=path, since=None, all=False, dry_run=False, retrieval_only=False, runner="adk",
+        no_warmup=True, profile="gpu", max_gated=8, max_positives=2,
+    )
 
 
 @pytest.mark.asyncio

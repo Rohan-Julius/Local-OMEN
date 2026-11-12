@@ -120,7 +120,10 @@ class Transcript(BaseModel):
 
     steps: list[ToolCallStep] = Field(default_factory=list)
     final_text: str = ""
-    stopped_reason: Literal["model_finished", "call_cap", "wall_clock_cap", "error"] = "model_finished"
+    stopped_reason: Literal["model_finished", "call_cap", "wall_clock_cap", "error", "llm_timeout"] = "model_finished"
+    # A sentence about why the loop ended early, when that needs saying
+    # (an LLM timeout); None otherwise.
+    note: str | None = None
 
 
 class AdjudicatorVerdict(BaseModel):
@@ -209,6 +212,24 @@ class RunRecord(BaseModel):
     ms_investigate: int | None = None
     ms_adjudicate: int | None = None
     ms_total: int | None = None
+    n_skipped: int | None = None
+
+
+class SkippedChunk(BaseModel):
+    """A chunk that cleared retrieval but was not (fully) processed because
+    of a cap. Never silently dropped: stored in `skipped_chunks` and
+    reported in the scan summary (production plan Phase 5)."""
+
+    run_id: str | None = None
+    file_path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    symbol: str | None = None
+    incident_ref: str | None = None  # the best candidate
+    similarity: float | None = None
+    triage_verdict: str | None = None  # "MATCH" for a positive skipped at the investigation cap, else None
+    stage: Literal["triage", "investigation"]
+    reason: str
 
 
 class ToolCallRecord(BaseModel):
