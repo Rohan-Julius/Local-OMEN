@@ -15,7 +15,7 @@ import subprocess
 
 import pytest
 
-from omen import archivist, config, runners, store, vectors
+from omen import archivist, runners, store, vectors
 
 BEFORE_CODE = (
     "import functools\n\n"

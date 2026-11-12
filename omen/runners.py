@@ -17,7 +17,7 @@ from typing import Callable, Literal, Protocol
 import ollama
 from pydantic import BaseModel
 
-from omen import agents, tools as tools_mod
+from omen import config, tools as tools_mod
 from omen.config import LLM_MODEL, NUM_CTX, NUM_GPU, TEMPERATURE, THINK_DEFAULT
 from omen.contracts import Transcript
 from omen.tools import ToolBudget
@@ -50,13 +50,22 @@ def _stopped_reason(budget: ToolBudget, steps: list, final_text: str) -> Literal
     return "model_finished"
 
 
+def _agents():
+    """Import agents.py (and with it google.adk) only when an ADK role
+    actually runs. Importing ADK costs seconds, and commands that never
+    call a model should not pay for it (audit B28)."""
+    from omen import agents
+
+    return agents
+
+
 class ADKRoleRunner:
     """The default. Delegates all google.adk usage to agents.py."""
 
     async def run_structured(
         self, instruction: str, prompt: str, schema: type[BaseModel], think: bool = THINK_DEFAULT
     ) -> BaseModel:
-        return await agents.run_structured_adk(instruction, prompt, schema, think)
+        return await _agents().run_structured_adk(instruction, prompt, schema, think)
 
     async def run_tooled(
         self,
@@ -72,7 +81,7 @@ class ADKRoleRunner:
         # ADK's own hard safety net, set a few calls above our budget's
         # cap: belt and braces in case the model ignores the budget's
         # stop-and-answer message entirely.
-        final_text = await agents.run_tooled_adk(
+        final_text = await _agents().run_tooled_adk(
             instruction, prompt, wrapped, max_llm_calls=budget.max_calls + 4, think=think, on_text=on_text
         )
         return Transcript(steps=steps, final_text=final_text, stopped_reason=_stopped_reason(budget, steps, final_text))
@@ -81,13 +90,24 @@ class ADKRoleRunner:
 class DirectOllamaRunner:
     """Ollama's `format` parameter constrains decoding to a JSON schema —
     a stronger guarantee than instruct-and-validate — and `/api/chat`
-    returns `tool_calls` natively, so this needs no google.adk at all."""
+    returns `tool_calls` natively, so this needs no google.adk at all.
+
+    The client is pointed at `config.OLLAMA_HOST` explicitly (B16), never
+    the ollama library's own default."""
+
+    def __init__(self) -> None:
+        self._client: ollama.Client | None = None
+
+    def _ollama(self) -> ollama.Client:
+        if self._client is None:
+            self._client = ollama.Client(host=config.OLLAMA_HOST)
+        return self._client
 
     async def run_structured(
         self, instruction: str, prompt: str, schema: type[BaseModel], think: bool = THINK_DEFAULT
     ) -> BaseModel:
         def call():
-            return ollama.chat(
+            return self._ollama().chat(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": instruction},
@@ -125,7 +145,7 @@ class DirectOllamaRunner:
         for _ in range(budget.max_calls + 4):
 
             def call(msgs=list(messages)):
-                return ollama.chat(
+                return self._ollama().chat(
                     model=LLM_MODEL,
                     messages=msgs,
                     tools=wrapped,

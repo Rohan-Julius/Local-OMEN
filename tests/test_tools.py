@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from omen import config, store, tools, vectors
+from omen import store, tools, vectors
 from omen.tools import PathEscapesRoot, ToolBudget
 
 

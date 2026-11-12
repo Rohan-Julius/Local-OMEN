@@ -263,3 +263,50 @@ def test_content_hash_is_deterministic_and_content_addressed(tmp_path):
     path.write_text("def f():\n    return 2\n")
     chunks3 = scout.chunk_file(path, repo_root=tmp_path)
     assert chunks3[0].content_hash != chunks1[0].content_hash
+
+
+def test_b29_non_ascii_filenames_are_found_in_every_scope(tmp_path):
+    """B29: without `-z`, git quotes paths with non-ASCII bytes
+    (`"caf\303\251.py"`), the quoted line fails the `.py` check, and the
+    file was silently dropped from every scope."""
+    _init_repo(tmp_path)
+    committed = tmp_path / "café.py"
+    nested = tmp_path / "naïve dir" / "über.py"
+    nested.parent.mkdir()
+    for path in (committed, nested):
+        path.write_text("def f():\n    return 1\n", encoding="utf-8")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "initial")
+
+    assert scout.resolve_scope(tmp_path, all_files=True).files == sorted([committed, nested])
+
+    committed.write_text("def f():\n    return 2\n", encoding="utf-8")  # unstaged change
+    untracked = tmp_path / "ñew.py"
+    untracked.write_text("def g():\n    return 1\n", encoding="utf-8")
+    assert scout.resolve_scope(tmp_path).files == sorted([committed, untracked])
+    assert scout.resolve_scope(tmp_path, since="HEAD").files == sorted([committed, untracked])
+
+    # chunking still works on the path Scout returned
+    chunks = scout.chunk_files([untracked], repo_root=tmp_path)
+    assert [c.file_path for c in chunks] == ["ñew.py"]
+
+
+def test_since_scope_includes_untracked_files_once(tmp_path):
+    """`--since` used to list only tracked files that changed since the
+    ref; new untracked files are part of "what changed" too. Same
+    de-duplicated union as the default scope."""
+    _init_repo(tmp_path)
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n")
+    _git(tmp_path, "add", "a.py")
+    _git(tmp_path, "commit", "-qm", "initial")
+    (tmp_path / "b.py").write_text("def g():\n    return 2\n")
+    _git(tmp_path, "add", "b.py")
+    _git(tmp_path, "commit", "-qm", "second")
+    (tmp_path / "a.py").write_text("def f():\n    return 10\n")  # changed since HEAD~1 and since HEAD
+    (tmp_path / "new.py").write_text("def h():\n    return 3\n")  # untracked
+    (tmp_path / ".gitignore").write_text("ignored.py\n")
+    (tmp_path / "ignored.py").write_text("def i():\n    return 4\n")
+
+    result = scout.resolve_scope(tmp_path, since="HEAD~1")
+    assert result.scope == "since:HEAD~1"
+    assert result.files == sorted(tmp_path / n for n in ("a.py", "b.py", "new.py"))

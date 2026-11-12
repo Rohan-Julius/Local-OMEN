@@ -2,6 +2,12 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+.coverage
+
+# packaging build output (pip install -e . / pip wheel .)
+build/
+*.egg-info/
 
 # derived index — rebuildable from SQLite via `omen reindex`
 omen_store/chroma/

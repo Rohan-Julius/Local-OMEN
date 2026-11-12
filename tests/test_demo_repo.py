@@ -10,12 +10,11 @@ against the real `demo_repo/`, against an isolated store seeded from the
 real `incidents.yaml` (never the live on-disk ledger/Chroma index).
 """
 import argparse
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from omen import cli, config, store, vectors
+from omen import cli, store, vectors
 
 DEMO_REPO = Path(__file__).resolve().parent.parent / "demo_repo"
 INCIDENTS_YAML = Path(__file__).resolve().parent.parent / "incidents.yaml"
@@ -23,11 +22,17 @@ INCIDENTS_YAML = Path(__file__).resolve().parent.parent / "incidents.yaml"
 
 def test_no_redis_anywhere_in_demo_repo():
     """PLAN.md: "grep -ri redis demo_repo/ returns nothing" — the true
-    positive shares OMEN-001's mechanism with no shared vocabulary."""
-    result = subprocess.run(
-        ["grep", "-ril", "redis", str(DEMO_REPO)], capture_output=True, text=True
-    )
-    assert result.stdout.strip() == "", f"unexpected Redis mention(s): {result.stdout}"
+    positive shares OMEN-001's mechanism with no shared vocabulary.
+
+    The same check as `grep -ril redis` (every file, any case, binary files
+    included), in Python so it does not depend on `grep` being on PATH
+    (it is not on every Windows machine or CI runner)."""
+    hits = [
+        str(path.relative_to(DEMO_REPO))
+        for path in sorted(DEMO_REPO.rglob("*"))
+        if path.is_file() and b"redis" in path.read_bytes().lower()
+    ]
+    assert hits == [], f"unexpected Redis mention(s): {hits}"
 
 
 @pytest.fixture

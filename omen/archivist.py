@@ -7,6 +7,8 @@ tool set (`build_learn_git_tools`), not a different agent.
 No new google.adk touchpoint: the Archivist is just another tools-agent
 driven through the same `RoleRunner.run_tooled` the Investigator uses
 (agents.py / runners.py), with its own prompt and its own three-tool set.
+Prompts come from the `omen.prompts` package, so importing this module
+does not import ADK.
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-from omen import agents, tools as tools_mod
+from omen import prompts, tools as tools_mod
 from omen.config import ARCHIVIST_THINK_DEFAULT
 from omen.contracts import Transcript
 from omen.tools import ToolBudget
@@ -46,7 +48,7 @@ async def learn_from_postmortem(
     `postmortem_path` is relative to `allowed_root` (it is what the model
     passes to read_file). `source` is the provenance recorded on the
     incident; it defaults to `postmortem:<postmortem_path>`."""
-    instruction = agents.load_prompt("archivist_postmortem.txt")
+    instruction = prompts.load_prompt("archivist_postmortem.txt")
     learn_tools = tools_mod.build_learn_postmortem_tools(
         conn, allowed_root, source=source or f"postmortem:{postmortem_path}"
     )
@@ -79,7 +81,7 @@ async def learn_from_commit(
     (`archivist_git.txt`, centered on describing the pre-change failure
     rather than the fix) and the tool set (`build_learn_git_tools`)
     differ."""
-    instruction = agents.load_prompt("archivist_git.txt")
+    instruction = prompts.load_prompt("archivist_git.txt")
     learn_tools = tools_mod.build_learn_git_tools(conn, repo_root, source=f"git:{sha}")
     budget = ToolBudget()
     prompt = _build_git_prompt(sha)

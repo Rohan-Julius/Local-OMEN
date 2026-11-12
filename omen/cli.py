@@ -1,19 +1,41 @@
 """The deterministic orchestrator. Pipeline stage order lives here; agentic
 tool loops live inside individual roles (agents.py / runners.py, from Phase
-6 on). PLAN.md: ADK is async, so the entry point is asyncio.run(main()) even
-for today's synchronous subcommands.
+6 on). PLAN.md: ADK is async, so main() is a coroutine even for the
+synchronous subcommands; `entrypoint()` is the sync wrapper behind the
+`omen` console script.
+
+Exit codes (audit B18): 0 success, 1 user error (bad arguments, a missing
+input file, an unknown ref, an empty ledger), 2 reserved for `--fail-on`
+(production plan Phase 7), 3 runtime or model error.
+
+ADK is imported only by commands that run a model (audit B28): runners.py
+is imported inside `_make_runner`, and runners.py imports agents.py (the
+only google.adk importer) only when an ADK role runs.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from omen import agents, archivist, config, fixtures as fixtures_mod, librarian, report, runners, scout, sifter, store, tools as tools_mod, vectors
+from omen import (
+    archivist,
+    config,
+    fixtures as fixtures_mod,
+    librarian,
+    prompts,
+    report,
+    scout,
+    sifter,
+    store,
+    tools as tools_mod,
+    vectors,
+)
 from omen.contracts import AdjudicatorVerdict, Finding, GatedChunk, RetrievalCandidate, RunRecord, ToolCallRecord, Transcript, TriageVerdict
 
 # Windows consoles default to a legacy codepage that mangles em-dashes and
@@ -24,36 +46,58 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+EXIT_OK = 0
+EXIT_USER_ERROR = 1
+EXIT_FINDINGS = 2  # reserved: `--fail-on` (production plan Phase 7)
+EXIT_RUNTIME_ERROR = 3
 
-def cmd_seed(args: argparse.Namespace) -> None:
+log = logging.getLogger("omen")
+
+
+def _user_error(message: str) -> int:
+    print(f"error: {message}")
+    return EXIT_USER_ERROR
+
+
+def _make_runner(name: str):
+    """The only place the CLI imports runners.py, so commands that never
+    run a model never import an LLM framework (B28)."""
+    from omen import runners
+
+    return runners.DirectOllamaRunner() if name == "direct" else runners.ADKRoleRunner()
+
+
+def cmd_seed(args: argparse.Namespace) -> int | None:
+    if not Path(args.yaml_path).is_file():
+        return _user_error(f"{args.yaml_path} is not a file")
     conn = store.connect()
     incidents = store.seed_from_yaml(conn, Path(args.yaml_path))
     print(f"Seeded {len(incidents)} incident(s) from {args.yaml_path}.")
     print("Run `omen reindex` to rebuild the vector index.")
 
 
-def cmd_reindex(args: argparse.Namespace) -> None:
+def cmd_reindex(args: argparse.Namespace) -> int | None:
     conn = store.connect()
     incidents = store.list_incidents(conn)
     n = vectors.reindex(incidents)
     print(f"Reindexed {len(incidents)} incident(s), {n} variant(s) total.")
 
 
-def cmd_memory_list(args: argparse.Namespace) -> None:
+def cmd_memory_list(args: argparse.Namespace) -> int | None:
     conn = store.connect()
     incidents = store.list_incidents(conn)
     if not incidents:
         print("No incidents in the ledger yet. Run `omen seed incidents.yaml`.")
-        return
+        return EXIT_USER_ERROR
     for inc in incidents:
         print(f"{inc.ref}  [{inc.learned_by}]  {inc.title}  ({len(inc.surface_forms)} surface forms)")
 
 
-def cmd_memory_forget(args: argparse.Namespace) -> None:
+def cmd_memory_forget(args: argparse.Namespace) -> int | None:
     conn = store.connect()
     if not store.forget_incident(conn, args.ref):
         print(f"No incident with ref {args.ref!r} found.")
-        return
+        return EXIT_USER_ERROR
     vectors.delete_incident_variants(args.ref)
     print(f"Forgot {args.ref} (removed from ledger and vector index).")
 
@@ -83,10 +127,10 @@ def _postmortem_root(args: argparse.Namespace) -> tuple[Path, str] | None:
     return root, rel.as_posix()
 
 
-async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> None:
+async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> int | None:
     confined = _postmortem_root(args)
     if confined is None:
-        return
+        return EXIT_USER_ERROR
     root, rel_path = confined
     print(f"[archivist] reading {args.postmortem_path}...")
     transcript = await archivist.learn_from_postmortem(
@@ -107,11 +151,9 @@ async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> None:
         print("No incident was written.")
 
 
-async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> None:
-    # Path(args.repo), not Path.cwd(): prompts load from a cwd-relative
-    # "prompts/" (agents.PROMPTS_DIR), so the repo being learned from must
-    # stay a plain argument, exactly like `omen scan <path>` — cwd has to
-    # stay the omen project root for prompt loading to work at all.
+async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> int | None:
+    # The repo being learned from is a plain argument (--repo, default the
+    # cwd), exactly like `omen scan <path>`.
     repo_root = Path(args.repo).resolve()
     candidates = sifter.select_candidates(repo_root, args.from_git, max_commits=args.max_commits)
     print(f"[sifter] {args.from_git}: {len(candidates)} candidate(s) out of up to {args.max_commits} commit(s) considered")
@@ -145,18 +187,20 @@ async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> None:
         print("\nNo incidents were written.")
 
 
-async def cmd_learn(args: argparse.Namespace) -> None:
+async def cmd_learn(args: argparse.Namespace) -> int | None:
     if bool(args.postmortem_path) == bool(args.from_git):
-        print("error: pass exactly one of a postmortem path or --from-git <range>")
-        return
+        return _user_error("pass exactly one of a postmortem path or --from-git <range>")
+    if args.postmortem_path and not Path(args.postmortem_path).is_file():
+        return _user_error(f"{args.postmortem_path} is not a file")
+    if args.from_git and not Path(args.repo).is_dir():
+        return _user_error(f"--repo {args.repo} is not a directory")
 
     conn = store.connect()
-    runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
+    runner = _make_runner(args.runner)
 
     if args.from_git:
-        await _cmd_learn_git(args, conn, runner)
-    else:
-        await _cmd_learn_postmortem(args, conn, runner)
+        return await _cmd_learn_git(args, conn, runner)
+    return await _cmd_learn_postmortem(args, conn, runner)
 
 
 def _print_chunk_table(chunks) -> None:
@@ -241,10 +285,10 @@ async def _triage_and_investigate(
     run_id: str,
     stats: report.ScanStats,
 ) -> list[Finding]:
-    runner = runners.DirectOllamaRunner() if args.runner == "direct" else runners.ADKRoleRunner()
-    triage_instruction = agents.load_prompt("triage.txt")
-    investigator_instruction = agents.load_prompt("investigator.txt")
-    adjudicator_instruction = agents.load_prompt("adjudicator.txt")
+    runner = _make_runner(args.runner)
+    triage_instruction = prompts.load_prompt("triage.txt")
+    investigator_instruction = prompts.load_prompt("investigator.txt")
+    adjudicator_instruction = prompts.load_prompt("adjudicator.txt")
 
     triage_watch = report.Stopwatch()
     investigate_watch = report.Stopwatch()
@@ -353,7 +397,9 @@ async def _triage_and_investigate(
     return findings
 
 
-async def cmd_scan(args: argparse.Namespace) -> None:
+async def cmd_scan(args: argparse.Namespace) -> int | None:
+    if not Path(args.path).is_dir():
+        return _user_error(f"{args.path} is not a directory")
     repo_path = Path(args.path).resolve()
     scope_result = scout.resolve_scope(repo_path, since=args.since, all_files=args.all)
     chunks = scout.chunk_files(scope_result.files, repo_root=repo_path)
@@ -416,7 +462,7 @@ async def cmd_scan(args: argparse.Namespace) -> None:
     report.print_summary(stats, findings)
 
 
-def cmd_calibrate(args: argparse.Namespace) -> None:
+def cmd_calibrate(args: argparse.Namespace) -> int | None:
     """PLAN.md Phase 4: sweep the similarity floor over the 12 labeled
     fixtures and print where true positives stop surviving and where hard
     negatives start being rejected — the "knee" to set SIMILARITY_THRESHOLD
@@ -424,6 +470,8 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     PLAN.md that's a signal about incidents.yaml's surface forms, not the
     threshold — do not chase it by lowering the floor.
     """
+    if not Path(args.fixtures_path).is_file():
+        return _user_error(f"{args.fixtures_path} is not a file (pass --fixtures-path)")
     conn = store.connect()
     cases = fixtures_mod.load_fixtures(Path(args.fixtures_path))
     chunks = [fixtures_mod.fixture_to_chunk(f) for f in cases]
@@ -463,9 +511,41 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     )
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits with 2 on bad arguments; Omen reserves 2 for
+    `--fail-on` (Phase 7), so argument errors exit 1 like every other user
+    error. Subparsers inherit this class."""
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USER_ERROR, f"{self.prog}: error: {message}\n")
+
+
+def _add_global_options(parser: argparse.ArgumentParser, suppress: bool) -> None:
+    """--store/--verbose/--quiet, accepted before or after the subcommand.
+    Subcommand copies use SUPPRESS so an option given before the
+    subcommand is not reset by the subcommand's default."""
+    default = argparse.SUPPRESS if suppress else None
+    flag_default = argparse.SUPPRESS if suppress else False
+    parser.add_argument(
+        "--store",
+        default=default,
+        help="Store directory (default: $OMEN_HOME, else ./omen_store)",
+    )
+    noise = parser.add_mutually_exclusive_group()
+    noise.add_argument("-v", "--verbose", action="store_true", default=flag_default, help="Show debug diagnostics")
+    noise.add_argument("-q", "--quiet", action="store_true", default=flag_default, help="Show only errors in diagnostics")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="omen")
+    common = _Parser(add_help=False)
+    _add_global_options(common, suppress=True)
+
+    parser = _Parser(prog="omen")
+    _add_global_options(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", required=True)
+    _add_top_parser = sub.add_parser
+    sub.add_parser = lambda name, **kwargs: _add_top_parser(name, parents=[common], **kwargs)
 
     p_seed = sub.add_parser("seed", help="Load incidents.yaml into the SQLite ledger")
     p_seed.add_argument("yaml_path")
@@ -476,6 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_memory = sub.add_parser("memory", help="Inspect or edit the incident ledger")
     memory_sub = p_memory.add_subparsers(dest="memory_command", required=True)
+    _add_memory_parser = memory_sub.add_parser
+    memory_sub.add_parser = lambda name, **kwargs: _add_memory_parser(name, parents=[common], **kwargs)
 
     p_memory_list = memory_sub.add_parser("list", help="List all incidents")
     p_memory_list.set_defaults(func=cmd_memory_list)
@@ -559,13 +641,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def main() -> None:
+class _DiagnosticFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        text = f"{record.levelname.lower()}: {record.getMessage()}"
+        if record.exc_info:
+            text += "\n" + self.formatException(record.exc_info)
+        return text
+
+
+def _configure_logging(verbose: bool, quiet: bool) -> None:
+    """Diagnostics go to stderr through `logging`; normal command output
+    stays on stdout and is not affected by --verbose/--quiet."""
+    level = logging.DEBUG if verbose else logging.ERROR if quiet else logging.WARNING
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_DiagnosticFormatter())
+    root = logging.getLogger("omen")
+    root.handlers[:] = [handler]
+    root.setLevel(level)
+    root.propagate = False
+
+
+async def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    result = args.func(args)
-    if asyncio.iscoroutine(result):
-        await result
+    args = parser.parse_args(argv)
+    if args.verbose and args.quiet:  # one given before the subcommand, one after
+        parser.error("argument -q/--quiet: not allowed with argument -v/--verbose")
+    command = " ".join(filter(None, [args.command, getattr(args, "memory_command", None)]))
+    _configure_logging(args.verbose, args.quiet)
+    if args.store:
+        config.set_store_dir(args.store)
+    log.debug("store: %s", config.STORE_DIR.resolve())
+    log.debug("ollama host: %s", config.OLLAMA_HOST)
+
+    start = time.perf_counter()
+    try:
+        result = args.func(args)
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception as e:  # runtime or model error: one line, not a traceback (B18)
+        log.debug("traceback:", exc_info=True)
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_RUNTIME_ERROR
+    finally:
+        log.debug("%s finished in %.2fs", command, time.perf_counter() - start)
+    return EXIT_OK if result is None else int(result)
+
+
+def entrypoint() -> None:
+    """Console-script entry point (`omen = omen.cli:entrypoint`)."""
+    sys.exit(asyncio.run(main()))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    entrypoint()

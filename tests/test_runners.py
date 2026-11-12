@@ -7,7 +7,7 @@ Live Ollama required (skips gracefully without it).
 
 import pytest
 
-from omen import agents, config, store, tools
+from omen import agents, store, tools
 from omen.contracts import TriageVerdict
 from omen.runners import ADKRoleRunner, DirectOllamaRunner
 

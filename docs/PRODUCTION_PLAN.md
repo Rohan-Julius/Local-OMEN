@@ -19,7 +19,10 @@ a web UI, multi-language scanning or a cloud backend. Those stay out of scope (`
    and passes after.
 3. **Do not silently change retrieval behaviour.** Any change to prompts, embeddings, prefixes,
    `incidents.yaml` or `fixtures/` must be followed by `omen calibrate` and the fixture/triage
-   gates, with before/after numbers written in the phase notes.
+   gates, with before/after numbers written in the phase notes. **Tool docstrings and generated
+   prompt text count as prompts** (the model sees both: docstrings become tool descriptions, and
+   the CLI builds the user messages). Change them only to correct a factual error, and list each
+   change in the Progress log.
 4. **Low commit frequency.** One commit per phase (message `phase N: <summary>`). Push only at the
    three milestones marked **[PUSH]**. One PR to `main` at the end.
 5. **Two test tiers.** `unit` tests (no model, run everywhere and in CI) and `live` tests (need
@@ -33,10 +36,10 @@ a web UI, multi-language scanning or a cloud backend. Those stay out of scope (`
 |---|---|---|---|
 | 0 | Baseline and test tiers | B19, B20 | `pytest -m "not live"` runs everywhere; baseline numbers recorded |
 | 1 | Security and correctness | B1, B2, B3, B4, B5, B9, B10, B11 | every listed bug has a failing-then-passing test |
-| 2 | Packaging, config, CI **[PUSH]** | B16, B18, B24, B28, cwd-relative paths | `pip install -e .` gives an `omen` command that works from any directory; CI green |
+| 2 | Packaging, config, CI **[PUSH]** | B16, B18, B24, B28, B29, cwd-relative paths | `pip install -e .` gives an `omen` command that works from any directory; CI green |
 | 3 | Trustworthy verdicts | B6, B7, B12, B13, B14, B15, B17 | evidence citations are validated; audit trail covers both missions |
 | 4 | Memory integrity | B8, B26, schema migrations | dedup merges instead of overwriting; ledger has history; schema is versioned |
-| 5 | Reliability and scale **[PUSH]** | B5 follow-up, B27, PLAN caps | warm-up + retry; per-call timeouts; `--max-gated`; CPU profile; full suite passes on CPU |
+| 5 | Reliability and scale **[PUSH]** | B5 part 2 (per-LLM-call timeout), B27, PLAN caps | warm-up + retry; per-call timeouts; `--max-gated`; CPU profile; full suite passes on CPU |
 | 6 | Honest evaluation | B21, threshold tuned on test set | held-out fixture set with reported precision/recall; prompt contamination removed |
 | 7 | Usable outputs | Markdown report, PLAN features | Markdown/JSON/SARIF reports, `--fail-on` exit codes, pre-commit hook |
 | 8 | Docs and release **[PUSH]** | A1–A29, B25 | docs match code; reference doc updated; CHANGELOG; PR opened |
@@ -76,6 +79,15 @@ before (92) or more.
 **Exit criteria:** all unit tests pass; each fix has its test; `docs/complete info about project.md`
 Appendix B marked "fixed in phase 1" for these IDs (doc edit happens in Phase 8; note it in the log).
 
+**B5 is partial after Phase 1.** The wall clock now starts at the first tool call, so a slow first
+model turn no longer uses up the budget, but every model turn after the first tool call still
+counts against it. On CPU a slow second turn can still get the next tool call refused. The second
+half is in Phase 5 ("B5 part 2").
+
+**Found during Phase 1 (B29):** Scout drops `.py` files with non-ASCII names in every scope, because
+git quotes such paths (`"caf\303\251.py"`) and the quoted line no longer ends in `.py`. Fixed in
+Phase 2.
+
 ## Phase 2: Packaging, configuration, CI **[PUSH]**
 
 - Add `pyproject.toml`: package metadata, Python `>=3.11,<3.13`, dependencies (pin `google-genai`
@@ -95,6 +107,13 @@ Appendix B marked "fixed in phase 1" for these IDs (doc edit happens in Phase 8;
 - CI: `.github/workflows/ci.yml` on push/PR: Python 3.11 on ubuntu and windows, `pip install -e .[dev]`,
   `ruff check`, `pytest -m "not live" --cov=omen`. Add the badge to the README.
 - Add `ruff` config (and `mypy` on `omen/contracts.py`, `omen/tools.py`, `omen/store.py` to start).
+- **B29:** Scout reads git paths unquoted (`-z` output) in every scope; test with a non-ASCII
+  filename.
+- `--since` includes untracked files too (same de-duplicated union as the default scope).
+- Fix the `read_file` tool docstring ("relative to the project root" is wrong since B4); log it as
+  a prompt change (ground rule 3).
+- Fake the embedding calls in the two `tests/test_report.py` persistence tests so they run in the
+  unit tier and CI covers run/finding/tool_call persistence.
 
 **Exit criteria:** fresh clone → `pip install -e .[dev]` → `omen --help` works from another
 directory; CI green on both OSes.
@@ -104,7 +123,7 @@ directory; CI green on both OSes.
 - **Evidence validation (B6):** before accepting `confirmed`, every `evidence_lines` entry must parse
   as `path:line`, point to an existing line, and be inside the chunk **or** inside a range the
   Investigator actually read (from the transcript). Otherwise downgrade to `unverified` with a reason.
-- **Adjudicator blindness (B7):** remove "Triage already ruled…" from `prompts/adjudicator.txt` and
+- **Adjudicator blindness (B7):** remove "Triage already ruled…" from `omen/prompts/adjudicator.txt` and
   keep Triage's `code_mechanism` out of anything the Adjudicator sees; extend the blindness test to
   cover the system instruction. Re-run the triage/adjudicator live tests and log the numbers.
 - **Structured incident choice (B17):** add `incident_ref: Literal[<candidate refs>]` to the
@@ -122,8 +141,9 @@ can no longer produce `confirmed`; schema migration from Phase 4 or a fresh DB w
   (de-duplicated), keeps `occurred_on`, and appends provenance instead of overwriting it
   (`sources` list or an `incident_history` table with the previous row as JSON).
 - **History and undo:** `omen memory show <ref>`, `omen memory history <ref>`, `omen memory revert <ref>`.
-- **Schema versioning:** `PRAGMA user_version` + a small ordered migration list in `store.py`; tests
-  that migrate an old-format DB.
+- **Schema versioning:** build it on the existing `meta` table (added in Phase 1 for the B11 ref
+  high-water mark): a `schema_version` key + a small ordered migration list in `store.py`; tests
+  that migrate an old-format DB (including one with no `meta` table).
 - **Incremental reindex (B26):** `write_incident` re-embeds only the changed incident's variants
   (delete by `incident_ref`, upsert new ones); `omen reindex` stays the full rebuild.
 - **Integrity check:** `omen doctor` compares SQLite variants with Chroma ids and reports drift;
@@ -136,7 +156,8 @@ reports clean after seed/learn/forget sequences.
 
 - **Warm-up (B27):** one throwaway generation at the start of LLM commands, with one retry on the
   known CUDA first-call failure.
-- **Timeouts:** a per-LLM-call timeout (configurable) separate from the tool budget; a clear
+- **B5 part 2: separate per-LLM-call timeout.** A per-LLM-call timeout (configurable) separate from
+  the tool budget, so model generation time no longer counts against the tool wall clock; a clear
   `stopped_reason="llm_timeout"`.
 - **Caps from PLAN.md:** `--max-gated N` (default 8) and `--max-positives N` (default 2) for
   investigations, with skipped chunks reported, never silently dropped.
@@ -153,7 +174,7 @@ on the RTX 5050 the demo scan finishes within the `PLAN.md` target (~120 s) and 
 
 - Split fixtures: `fixtures/calibration.yaml` (used for tuning) and `fixtures/heldout.yaml`
   (never used for tuning), at least 8 per class in the held-out set, written in different domains.
-- Remove contamination (B21): replace the two worked hard negatives in `prompts/triage.txt` with new
+- Remove contamination (B21): replace the two worked hard negatives in `omen/prompts/triage.txt` with new
   examples that are in neither fixture set.
 - `omen eval` command: runs retrieval + Triage (+ optional full pipeline) on the held-out set and
   prints precision, recall, and per-stage confusion counts; writes `eval/results-<date>.json`.
@@ -201,6 +222,8 @@ Revisit only after Phase 8.
 |---|---|---|---|
 | 2026-11-12 | 0 | `pytest -m "not live"`: **65 passed, 27 deselected** (92 total, unchanged). Full suite with Ollama port 11434 blocked: **65 passed, 27 skipped**. `tests/test_fixtures.py` (live, embed-only): 3 passed against the temp seeded store. `omen calibrate`: identical to the audit's sweep (table below). | Machine: CPU-only i7 laptop, Ollama reachable. B19: `live`/`slow` markers registered in `pytest.ini` (`--strict-markers`); per-test `@pytest.mark.live` + skip hook in `tests/conftest.py`; the 6 pure tests in `test_report.py` (4), `test_hardening.py` (1), `test_demo_repo.py` (1) now run without Ollama. B20: `test_fixtures.py`/`test_triage.py` use the `seeded_store` fixture (temp SQLite + Chroma seeded from `incidents.yaml`). Full live suite not run (CPU: ~1.5 h); `test_triage.py` not run. |
 | 2026-11-12 | 1 | `pytest -m "not live"`: **86 passed, 27 deselected** (113 total; 21 new tests). Live: `tests/test_tools.py` **39 passed** (incl. the live `search_memory`/`get_incident` test); `tests/test_runners.py -k tooled` **4 passed** in 1243.97 s on CPU (adk transcript 499 s, direct transcript 350 s, adk call cap 211 s, direct call cap 174 s). | Each of B1 B2 B3 B4 B5 B9 B10 B11 has a test that failed on the unfixed code (20 failed + 1 guard test passing) and passes after the fix. B3 also confirmed by hand: old `read_commit("--output=<path>")` wrote the file. Prompts, embeddings, `incidents.yaml`, `fixtures/` unchanged, so calibrate was not re-run. Schema: new `meta` table (`CREATE TABLE IF NOT EXISTS`, holds the ref high-water mark for B11); the real `omen_store/omen.db` got the empty table on first connect, 6 incidents intact. Two existing tests updated because they asserted the old behaviour (`test_budget_trips_wall_clock_ceiling`, B5; `test_budget_catches_tool_exceptions_and_caches_the_error`, B10). Appendix B of `docs/complete info about project.md` still to be marked "fixed in phase 1" for these IDs (Phase 8). New finding, not fixed: Scout drops files with non-ASCII names (git quotes them, e.g. `"caf\303\251.py"`), in every scope. |
+| 2026-11-12 | 0–1 | Summary of Phases 0 and 1 (commits `30b1345`, `791102e`): unit tier 65 → **86 passed**, 27 live deselected (92 → 113 tests). Live: `test_tools.py` **39 passed**; `test_runners.py -k tooled` **4 passed** (1243.97 s, CPU); `test_fixtures.py` 3 passed. `omen calibrate` unchanged (0.35: TP 4/4, HN 2/4, unrelated 0/4). | Fixed: B19 B20 (Phase 0); B1 B2 B3 B4 B5 (partial) B9 B10 B11 (Phase 1). Found: B29. Not run: full live suite, `test_triage.py`. |
+| 2026-11-12 | 2 | `pytest -m "not live"`: **126 passed, 25 deselected** (151 total; 38 new, 2 moved live → unit); same run with global/system git config hidden (as on CI): 126 passed. Coverage (unit tier) **87%**. `ruff check .`: clean. Live: `tests/test_tools.py` **39 passed**; extra check `test_runners.py -k matches_true_positive` **2 passed** (adk 270 s, direct 165 s, CPU) through the new host plumbing. `omen memory list`: 3.46 s → **1.42 s** (median of 3; ADK no longer imported). Fresh venv `pip install -e .` + run from another directory: `omen --help` 0, `memory list --store` 1 on empty / 0 after `seed`; wheel contains the 5 prompts and the console script. | Fixed: B16, B18, B24, B28, B29; cwd-relative prompts and store. Prompts moved with `git mv` to `omen/prompts/` (git blob ids, file sha256 and loaded-text sha256 identical before/after for all 5); empty unused `prompts/chronicler.txt` removed. **Prompt change (rule 3):** `read_file` tool docstring, `file_path` arg: "relative to the project root" → "relative to the postmortem's own folder" (factual fix after B4). No other prompt, embedding, `incidents.yaml` or fixture change, so calibrate not re-run. `--since` now includes untracked files. `test_demo_repo` Redis check rewritten in Python (no `grep` on Windows CI). CI not yet observed green at time of commit (see push notes). Found: on Windows without long-path support, installing into a deep directory fails on a litellm data file (path > 260 chars); not an Omen bug, document in Phase 8. |
 
 Phase 0 calibration sweep (`python -m omen.cli calibrate`, real `omen_store/`, 2026-11-12):
 

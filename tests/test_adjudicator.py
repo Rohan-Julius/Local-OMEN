@@ -15,7 +15,7 @@ it); the prompt-independence and downgrade tests are pure and always run.
 
 import pytest
 
-from omen import agents, cli, config, runners, store, tools
+from omen import agents, cli, runners, store, tools
 from omen.contracts import (
     AdjudicatorVerdict,
     Chunk,

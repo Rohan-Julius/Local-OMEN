@@ -76,7 +76,7 @@ async def test_cmd_learn_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
 
 import re  # noqa: E402
 
-from omen import agents, runners, tools as tools_mod, vectors  # noqa: E402
+from omen import runners, tools as tools_mod, vectors  # noqa: E402
 from omen.contracts import Transcript  # noqa: E402
 
 
@@ -99,13 +99,13 @@ class _ScriptedArchivist:
 @pytest.fixture
 def learn_sandbox(tmp_path, monkeypatch):
     """cwd = a fake project root holding a fake `.env`; the postmortem
-    lives in its own subdirectory."""
+    lives in its own subdirectory. The real prompts load from the package,
+    so changing the cwd away from the Omen checkout must not break them."""
     project = tmp_path / "project"
     (project / "postmortems").mkdir(parents=True)
     (project / ".env").write_text("FAKE_SECRET=do-not-leak\n")
     (project / "postmortems" / "incident.md").write_text("# Postmortem\nthe cache never invalidated\n")
     monkeypatch.chdir(project)
-    monkeypatch.setattr(agents, "load_prompt", lambda name: "test instruction")
     monkeypatch.setattr(runners, "ADKRoleRunner", _ScriptedArchivist)
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
     monkeypatch.setattr(vectors, "embed_query", lambda texts: [[1.0] for _ in texts])

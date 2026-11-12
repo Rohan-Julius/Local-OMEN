@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import itertools
 import os
-from pathlib import Path
 from typing import Callable
 
 from pydantic import BaseModel
@@ -16,29 +15,35 @@ from pydantic import BaseModel
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
 os.environ.pop("GOOGLE_API_KEY", None)
 
-from google.adk.agents import LlmAgent
-from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.adk.agents.invocation_context import LlmCallsLimitExceededError
-from google.adk.models.lite_llm import LiteLlm
-from google.adk.runners import InMemoryRunner
-from google.genai import types
+# The google.* imports must follow the two environment lines above.
+from google.adk.agents import LlmAgent  # noqa: E402
+from google.adk.agents.invocation_context import LlmCallsLimitExceededError  # noqa: E402
+from google.adk.agents.run_config import RunConfig, StreamingMode  # noqa: E402
+from google.adk.models.lite_llm import LiteLlm  # noqa: E402
+from google.adk.runners import InMemoryRunner  # noqa: E402
+from google.genai import types  # noqa: E402
 
-from omen.config import LLM_MODEL, NUM_CTX, NUM_GPU, TEMPERATURE, THINK_DEFAULT
+from omen import config  # noqa: E402
+from omen.config import LLM_MODEL, NUM_CTX, NUM_GPU, TEMPERATURE, THINK_DEFAULT  # noqa: E402
+from omen.prompts import load_prompt  # noqa: E402,F401 - kept for callers of agents.load_prompt
 
-PROMPTS_DIR = Path("prompts")
 _APP_NAME = "omen"
 _session_ids = itertools.count(1)
-
-
-def load_prompt(name: str) -> str:
-    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
 
 
 def _model(think: bool) -> LiteLlm:
     # PLAN.md "ollama_chat/, never ollama/" — and num_gpu/num_ctx/think are
     # the Phase 0 findings that are load-bearing for latency/correctness
-    # on this GPU (see README "Phase 0 results").
-    return LiteLlm(model=f"ollama_chat/{LLM_MODEL}", num_ctx=NUM_CTX, num_gpu=NUM_GPU, think=think, temperature=TEMPERATURE)
+    # on this GPU (see README "Phase 0 results"). api_base: the one
+    # configured Ollama address (B16), not LiteLLM's built-in default.
+    return LiteLlm(
+        model=f"ollama_chat/{LLM_MODEL}",
+        api_base=config.OLLAMA_HOST,
+        num_ctx=NUM_CTX,
+        num_gpu=NUM_GPU,
+        think=think,
+        temperature=TEMPERATURE,
+    )
 
 
 async def run_structured_adk(

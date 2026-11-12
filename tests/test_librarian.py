@@ -8,7 +8,6 @@ reachable.
 import pytest
 
 from omen import librarian, store, vectors
-from omen.config import OLLAMA_HOST
 from omen.contracts import Chunk, Incident
 
 

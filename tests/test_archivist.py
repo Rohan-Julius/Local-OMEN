@@ -10,7 +10,7 @@ without actually running the model.
 
 import pytest
 
-from omen import archivist, config, runners, store, vectors
+from omen import archivist, runners, store, vectors
 
 POSTMORTEM_TEXT = """# Postmortem: wrong user's data returned under load
 
@@ -101,7 +101,6 @@ async def test_archivist_dedups_on_second_run(tmp_path):
     assert second_ref, f"second run never wrote/updated an incident: {second.final_text}"
 
     incidents = store.list_incidents(conn)
-    matching = [i for i in incidents if i.ref == first_ref or i.ref == second_ref]
     assert first_ref == second_ref, (
         f"second run created a new ref ({second_ref}) instead of updating the first ({first_ref})"
     )

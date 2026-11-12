@@ -5,12 +5,39 @@ correctness on this specific GPU — see README.md "Phase 0 results".
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LLM_MODEL = "gemma4:12b-it-q4_K_M"
 EMBED_MODEL = "embeddinggemma"
 
-OLLAMA_HOST = "http://localhost:11434"
+# One Ollama address for every caller (audit B16): the embedding call
+# (vectors.py), the direct runner's ollama.Client (runners.py) and LiteLLM's
+# api_base (agents.py) all read config.OLLAMA_HOST at call time. Ollama's own
+# OLLAMA_HOST convention allows "host:port" without a scheme and the server
+# bind address "0.0.0.0", so the value is normalized to a URL a client can use.
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_OLLAMA_PORT = 11434
+
+
+def normalize_ollama_host(value: str | None) -> str:
+    value = (value or "").strip()
+    if not value:
+        return DEFAULT_OLLAMA_HOST
+    if "://" not in value:
+        value = f"http://{value}"
+    parts = urlsplit(value)
+    host = parts.hostname or "localhost"
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    port = parts.port or DEFAULT_OLLAMA_PORT
+    return f"{parts.scheme}://{host}:{port}{parts.path.rstrip('/')}"
+
+
+OLLAMA_HOST = normalize_ollama_host(os.environ.get("OLLAMA_HOST"))
 
 # PLAN.md Phase 0c, revised after real measurement on the RTX 5050 (8GB):
 # num_gpu forces full GPU residency (without it, Ollama silently splits
@@ -33,9 +60,25 @@ THINK_DEFAULT = False
 INVESTIGATOR_THINK_DEFAULT = True
 ARCHIVIST_THINK_DEFAULT = True
 
-STORE_DIR = Path("omen_store")
-DB_PATH = STORE_DIR / "omen.db"
-CHROMA_PATH = STORE_DIR / "chroma"
+# Store location. Precedence: the CLI's --store flag (set_store_dir), then
+# the OMEN_HOME environment variable, then ./omen_store relative to the
+# current directory (the original default). Other modules read these three
+# names from this module at call time, never as import-time copies.
+DEFAULT_STORE_DIR = Path("omen_store")
+STORE_DIR: Path
+DB_PATH: Path
+CHROMA_PATH: Path
+
+
+def set_store_dir(path: str | os.PathLike | None) -> Path:
+    global STORE_DIR, DB_PATH, CHROMA_PATH
+    STORE_DIR = Path(path) if path else DEFAULT_STORE_DIR
+    DB_PATH = STORE_DIR / "omen.db"
+    CHROMA_PATH = STORE_DIR / "chroma"
+    return STORE_DIR
+
+
+set_store_dir(os.environ.get("OMEN_HOME"))
 CHROMA_COLLECTION = "incidents"
 
 # Librarian (Phase 3). SIMILARITY_THRESHOLD chosen by Phase 4's fixture

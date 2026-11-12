@@ -1,5 +1,7 @@
 # Omen
 
+[![CI](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml/badge.svg?branch=production-hardening)](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml)
+
 Omen is a local, agentic system that turns your team's own incident history
 into a standing set of code reviewers. You teach it about past failures —
 either by pointing it at a postmortem or letting it read straight from git

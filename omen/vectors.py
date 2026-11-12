@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from pathlib import Path
 
 # Belt and braces (PLAN.md): Settings(anonymized_telemetry=False) below is
 # the primary switch, but Chroma also reads this env var directly in a few
@@ -19,13 +20,20 @@ import urllib.request
 # telemetry module is imported, so this sits above the `import chromadb`.
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
-import chromadb
-from chromadb.config import Settings
+import chromadb  # noqa: E402 - must follow the telemetry env var above
+from chromadb.config import Settings  # noqa: E402
 
-from omen.config import CHROMA_COLLECTION, CHROMA_PATH, EMBED_MODEL, OLLAMA_HOST
-from omen.contracts import Incident
+from omen import config  # noqa: E402
+from omen.config import CHROMA_COLLECTION, EMBED_MODEL  # noqa: E402
+from omen.contracts import Incident  # noqa: E402
 
-_EMBED_URL = f"{OLLAMA_HOST}/api/embed"
+# None means "use config.CHROMA_PATH" (read at call time, so --store and
+# OMEN_HOME apply). Tests set this to a temporary directory.
+CHROMA_PATH: Path | None = None
+
+
+def _chroma_path() -> Path:
+    return Path(CHROMA_PATH) if CHROMA_PATH else config.CHROMA_PATH
 
 
 def _embed(prompts: list[str]) -> list[list[float]]:
@@ -36,7 +44,7 @@ def _embed(prompts: list[str]) -> list[list[float]]:
         return []
     body = json.dumps({"model": EMBED_MODEL, "input": prompts}).encode()
     req = urllib.request.Request(
-        _EMBED_URL, data=body, headers={"Content-Type": "application/json"}
+        f"{config.OLLAMA_HOST}/api/embed", data=body, headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
@@ -58,9 +66,10 @@ def embed_document(texts: list[str], title: str = "none") -> list[list[float]]:
 
 
 def get_client() -> chromadb.ClientAPI:
-    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+    path = _chroma_path()
+    path.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(
-        path=str(CHROMA_PATH),
+        path=str(path),
         settings=Settings(anonymized_telemetry=False),
     )
 

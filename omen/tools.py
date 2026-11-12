@@ -19,8 +19,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from omen import librarian, scout, store, vectors
-from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, STORE_DIR, TOOL_WALL_CLOCK_SECONDS
+from omen import config, librarian, scout, store, vectors
+from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, TOOL_WALL_CLOCK_SECONDS
 from omen.contracts import IncidentSeed, ToolCallStep
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def deny_sensitive(root: Path, resolved: Path) -> None:
     ):
         raise PathDenied(f"{str(rel)!r} is a protected path (secrets, databases, omen_store/, .git/) and cannot be read")
     try:
-        resolved.relative_to(STORE_DIR.resolve())
+        resolved.relative_to(config.STORE_DIR.resolve())
     except ValueError:
         return
     raise PathDenied(f"{str(rel)!r} is inside Omen's store and cannot be read")
@@ -195,7 +195,7 @@ def _make_read_file(allowed_root: Path) -> Callable:
         """Read a postmortem or design document from disk.
 
         Args:
-            file_path: Path to the document, relative to the project root.
+            file_path: Path to the document, relative to the postmortem's own folder.
         """
         resolved = confine(allowed_root, file_path)
         deny_sensitive(allowed_root, resolved)

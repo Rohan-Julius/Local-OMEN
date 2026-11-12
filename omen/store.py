@@ -11,7 +11,8 @@ from pathlib import Path
 
 import yaml
 
-from omen.config import DB_PATH, REF_PREFIX
+from omen import config
+from omen.config import REF_PREFIX
 from omen.contracts import Incident, IncidentSeed, RunRecord, ToolCallRecord
 
 SCHEMA = """
@@ -83,7 +84,10 @@ CREATE TABLE IF NOT EXISTS meta (
 REF_HIGH_WATER_KEY = "ref_high_water"
 
 
-def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+def connect(db_path: Path | None = None) -> sqlite3.Connection:
+    """Open (creating if needed) the ledger. Default: `config.DB_PATH`,
+    read at call time so `--store` / OMEN_HOME apply."""
+    db_path = Path(db_path) if db_path else config.DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row

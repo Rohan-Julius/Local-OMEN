@@ -19,7 +19,7 @@ import socket
 
 import pytest
 
-from omen import agents, cli, config, store, vectors
+from omen import agents, cli, store, vectors
 from omen.contracts import TriageVerdict
 
 
