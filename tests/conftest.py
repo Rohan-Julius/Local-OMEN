@@ -53,6 +53,20 @@ def pytest_collection_modifyitems(config, items):
         item.add_marker(skip_live)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_default_store(tmp_path_factory, monkeypatch):
+    """Point the DEFAULT store (config.STORE_DIR / DB_PATH / CHROMA_PATH) at a
+    temporary directory for every test. A test that forgets its own
+    isolation then writes there, not to the developer's real `omen_store/`.
+    (Phase 4: a doctor test that called `vectors.reindex` before applying
+    `--store` emptied the real Chroma index.) Tests that set their own store
+    paths simply override these."""
+    default = tmp_path_factory.mktemp("default_store")
+    monkeypatch.setattr(config, "STORE_DIR", default)
+    monkeypatch.setattr(config, "DB_PATH", default / "omen.db")
+    monkeypatch.setattr(config, "CHROMA_PATH", default / "chroma")
+
+
 @pytest.fixture(scope="module")
 def seeded_store(tmp_path_factory):
     """A temporary SQLite ledger and Chroma index seeded from the real

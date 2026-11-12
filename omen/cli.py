@@ -26,6 +26,7 @@ from pathlib import Path
 from omen import (
     archivist,
     config,
+    doctor as doctor_mod,
     evidence,
     fixtures as fixtures_mod,
     librarian,
@@ -110,7 +111,76 @@ def cmd_memory_forget(args: argparse.Namespace) -> int | None:
         print(f"No incident with ref {args.ref!r} found.")
         return EXIT_USER_ERROR
     vectors.delete_incident_variants(args.ref)
-    print(f"Forgot {args.ref} (removed from ledger and vector index).")
+    print(f"Forgot {args.ref} (removed from ledger and vector index). Its history is kept: "
+          f"`omen memory revert {args.ref}` restores it.")
+
+
+def cmd_memory_show(args: argparse.Namespace) -> int | None:
+    conn = store.connect()
+    inc = store.get_incident(conn, args.ref)
+    if inc is None:
+        latest = store.list_history(conn, args.ref)
+        hint = f" (forgotten; `omen memory revert {args.ref}` restores it)" if latest else ""
+        return _user_error(f"no incident {args.ref}{hint}")
+    print(f"{inc.ref}  [{inc.kind}]  {inc.title}")
+    print(f"  severity:   {inc.severity or '-'}")
+    print(f"  occurred:   {inc.occurred_on or '-'}")
+    print(f"  created:    {inc.created_at}")
+    print(f"  mechanism:  {inc.failure_mechanism}")
+    print(f"  happened:   {inc.what_happened}")
+    print(f"  rule:       {inc.the_rule}")
+    print(f"  surface forms ({len(inc.surface_forms)}):")
+    for i, form in enumerate(inc.surface_forms, 1):
+        print(f"    {i}. {form}")
+    print(f"  sources ({len(inc.sources)}, original first):")
+    for src in inc.sources:
+        print(f"    {src.get('added_at')}  {src.get('learned_by')}  {src.get('source') or '-'}")
+
+
+def cmd_memory_history(args: argparse.Namespace) -> int | None:
+    conn = store.connect()
+    rows = store.list_history(conn, args.ref)
+    if not rows:
+        return _user_error(f"no history for {args.ref}")
+    state = "present" if store.get_incident(conn, args.ref) else "forgotten"
+    print(f"{args.ref} ({state})")
+    print(f"  {'ver':>3}  {'when (UTC)':19}  {'action':7}  source")
+    for r in rows:
+        extra = "  [+ unapplied proposal]" if r["has_proposal"] else ""
+        print(f"  {r['version']:>3}  {r['ts']:19}  {r['action']:7}  {r['source'] or '-'}{extra}")
+
+
+def cmd_memory_revert(args: argparse.Namespace) -> int | None:
+    conn = store.connect()
+    try:
+        incident, version = store.revert_incident(conn, args.ref, to=args.to)
+    except (LookupError, ValueError) as e:
+        return _user_error(str(e))
+    try:
+        n = vectors.reindex_incident(incident)
+    except Exception:
+        print(f"Restored {args.ref} from version {version} in the ledger, but the vector index could not be "
+              "updated. Run `omen doctor --fix` once Ollama is reachable.")
+        raise
+    print(f"Restored {args.ref} from version {version} ({n} variant(s) re-indexed).")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int | None:
+    if not config.DB_PATH.exists():
+        return _user_error(f"no ledger at {config.DB_PATH} (run `omen seed <incidents.yaml>`, or pass --store)")
+    conn = store.connect()
+    models, ollama_error = doctor_mod.probe_ollama()
+    report_ = doctor_mod.diagnose(conn, vectors.indexed_documents(), models, ollama_error)
+    for line in doctor_mod.render(report_):
+        print(line)
+    if args.fix and report_.drift:
+        print("\n--fix: rebuilding the index from the ledger (full reindex)...")
+        n = vectors.reindex(store.list_incidents(conn))
+        print(f"Reindexed {n} variant(s).\n")
+        report_ = doctor_mod.diagnose(conn, vectors.indexed_documents(), models, ollama_error)
+        for line in doctor_mod.render(report_):
+            print(line)
+    return EXIT_OK if report_.ok else EXIT_USER_ERROR
 
 
 def _start_run(conn, mission: str, repo_path: Path, scope: str, runner: str) -> str:
@@ -460,6 +530,7 @@ async def _triage_and_investigate(
             confidence=adj_verdict.confidence,
             tool_calls=len(transcript.steps),
             downgrade_reason=downgrade_reason,
+            stopped_reason=transcript.stopped_reason,
         )
         store.record_finding(conn, finding)
         findings.append(finding)
@@ -634,6 +705,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_memory_forget = memory_sub.add_parser("forget", help="Delete an incident by ref")
     p_memory_forget.add_argument("ref")
     p_memory_forget.set_defaults(func=cmd_memory_forget)
+
+    p_memory_show = memory_sub.add_parser("show", help="Show one incident in full")
+    p_memory_show.add_argument("ref")
+    p_memory_show.set_defaults(func=cmd_memory_show)
+
+    p_memory_history = memory_sub.add_parser("history", help="List an incident's create/update/forget/revert history")
+    p_memory_history.add_argument("ref")
+    p_memory_history.set_defaults(func=cmd_memory_history)
+
+    p_memory_revert = memory_sub.add_parser(
+        "revert", help="Restore an incident from history (undo its last change, or bring back a forgotten one)"
+    )
+    p_memory_revert.add_argument("ref")
+    p_memory_revert.add_argument("--to", type=int, default=None, metavar="N", help="Restore version N (see `memory history`)")
+    p_memory_revert.set_defaults(func=cmd_memory_revert)
+
+    p_doctor = sub.add_parser("doctor", help="Check the store: ledger vs index, Ollama and models, schema version")
+    p_doctor.add_argument("--fix", action="store_true", help="Rebuild the index from the ledger if it has drifted")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_learn = sub.add_parser("learn", help="Form a memory from a postmortem document or raw git history")
     p_learn.add_argument(

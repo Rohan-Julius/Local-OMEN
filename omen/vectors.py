@@ -95,17 +95,8 @@ def _variants(incident: Incident) -> list[tuple[str, str, str]]:
     return out
 
 
-def reindex(incidents: list[Incident]) -> int:
-    """Rebuild the Chroma collection from SQLite. Deterministic ids mean
-    re-seeding upserts rather than duplicating. Returns the number of
-    variants indexed."""
-    client = get_client()
-    try:
-        client.delete_collection(CHROMA_COLLECTION)
-    except Exception:
-        pass  # first run: collection doesn't exist yet
-    col = get_collection(client)
-
+def _records(incidents: list[Incident]) -> tuple[list[str], list[str], list[dict]]:
+    """(ids, texts, metadatas) for every variant of `incidents`."""
     ids: list[str] = []
     texts: list[str] = []
     metadatas: list[dict] = []
@@ -122,13 +113,50 @@ def reindex(incidents: list[Incident]) -> int:
                     "severity": incident.severity or "",
                 }
             )
+    return ids, texts, metadatas
 
+
+def reindex(incidents: list[Incident]) -> int:
+    """Rebuild the Chroma collection from SQLite (`omen reindex`, and
+    `omen doctor --fix`). Returns the number of variants indexed."""
+    client = get_client()
+    try:
+        client.delete_collection(CHROMA_COLLECTION)
+    except Exception:
+        pass  # first run: collection doesn't exist yet
+    col = get_collection(client)
+
+    ids, texts, metadatas = _records(incidents)
     if not ids:
         return 0
 
     embeddings = embed_query(texts)
     col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
     return len(ids)
+
+
+def reindex_incident(incident: Incident) -> int:
+    """Re-embed ONE incident's variants (audit B26): delete its variants by
+    `incident_ref`, upsert the new ones. Used by `write_incident` and
+    `omen memory revert`; the rest of the collection is untouched, so a
+    write costs one incident's embeddings, not the whole ledger's. The
+    embedding happens first, so a failed embed leaves the old variants in
+    place. Returns the number of variants indexed."""
+    ids, texts, metadatas = _records([incident])
+    embeddings = embed_query(texts)
+    col = get_collection()
+    col.delete(where={"incident_ref": incident.ref})
+    col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    return len(ids)
+
+
+def indexed_documents() -> dict[str, str]:
+    """{variant id: document} for everything in the collection, without
+    creating a store that does not exist (`omen doctor` is read-only)."""
+    if not _chroma_path().exists():
+        return {}
+    got = get_collection().get(include=["documents"])
+    return dict(zip(got["ids"], got["documents"]))
 
 
 def count() -> int:

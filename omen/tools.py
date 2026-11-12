@@ -350,8 +350,12 @@ def _make_write_incident(conn: sqlite3.Connection, learned_by: str, source: str)
             source=source,
             learned_by=learned_by,
         )
-        store.upsert_incident(conn, seed)
-        vectors.reindex(store.list_incidents(conn))
+        if existing_ref:
+            # A near-duplicate: merge, never overwrite curated text (audit B8).
+            incident = store.merge_incident(conn, ref, seed)
+        else:
+            incident = store.upsert_incident(conn, seed)
+        vectors.reindex_incident(incident)  # this incident's variants only (audit B26)
         return ref
 
     return write_incident

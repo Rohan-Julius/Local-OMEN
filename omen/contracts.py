@@ -36,6 +36,10 @@ class Incident(IncidentSeed):
 
     id: int
     created_at: str
+    # Every provenance the incident has had, oldest first: dicts with
+    # `source`, `learned_by` and `added_at`. `source`/`learned_by` above stay
+    # the ORIGINAL provenance; later merges only append here (audit B8).
+    sources: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +179,9 @@ class Finding(BaseModel):
     # Why a `confirmed` verdict was downgraded to `unverified` by evidence
     # validation (omen/evidence.py, audit B6); None if it was not.
     downgrade_reason: str | None = None
+    # Why the Investigator's tool loop ended (model_finished, call_cap,
+    # wall_clock_cap, error). None for findings made before schema v3.
+    stopped_reason: str | None = None
 
 
 class RunRecord(BaseModel):

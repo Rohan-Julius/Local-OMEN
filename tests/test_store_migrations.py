@@ -82,10 +82,12 @@ def test_old_database_upgrades_in_place_without_losing_rows(tmp_path, with_meta)
 
     conn = store.connect(db)
 
-    assert store.schema_version(conn) == store.SCHEMA_VERSION == 2
+    assert store.schema_version(conn) == store.SCHEMA_VERSION == 3
     assert {"note"} <= _columns(conn, "tool_calls")
     assert {"ms_scout", "ms_adjudicate", "n_written"} <= _columns(conn, "runs")
-    assert {"downgrade_reason"} <= _columns(conn, "findings")
+    assert {"downgrade_reason", "stopped_reason"} <= _columns(conn, "findings")
+    assert "sources" in _columns(conn, "incidents")
+    assert {"ref", "version", "ts", "action", "snapshot", "source", "proposal"} <= _columns(conn, "incident_history")
     assert _counts(conn) == {
         "incidents": 1, "surface_forms": 2, "chunk_vectors": 1, "runs": 1, "findings": 1, "tool_calls": 1,
     }
@@ -97,7 +99,7 @@ def test_old_database_upgrades_in_place_without_losing_rows(tmp_path, with_meta)
 
     # A second connect is a no-op: nothing re-applied, nothing lost.
     conn = store.connect(db)
-    assert store.schema_version(conn) == 2
+    assert store.schema_version(conn) == 3
     assert _counts(conn)["findings"] == 1
 
 
@@ -120,3 +122,76 @@ def test_a_failing_migration_is_rolled_back(tmp_path, monkeypatch):
     conn.row_factory = sqlite3.Row
     assert "note" not in _columns(conn, "tool_calls")  # the first statement was rolled back too
     assert conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone() is None
+
+
+# ---------------------------------------------------------------------------
+# Version 2 -> 3 (Phase 4): incident history, provenance list, stopped_reason
+# ---------------------------------------------------------------------------
+
+
+def _make_v2_db(path):
+    """A real version-2 database: built by the real migrations, stopped at 2,
+    then filled with rows."""
+    real = store.MIGRATIONS
+    store.MIGRATIONS = [m for m in real if m[0] <= 2]
+    try:
+        conn = store.connect(path)
+    finally:
+        store.MIGRATIONS = real
+    conn.executescript(OLD_ROWS)
+    conn.execute("INSERT INTO meta (key, value) VALUES ('ref_high_water', '4')")
+    conn.execute("UPDATE findings SET downgrade_reason = 'kept' WHERE run_id = 'r1'")
+    conn.execute("UPDATE runs SET ms_scout = 5, n_written = 2 WHERE run_id = 'r1'")
+    conn.commit()
+    assert store.schema_version(conn) == 2
+    conn.close()
+
+
+def test_version_2_database_upgrades_to_3_without_losing_rows(tmp_path):
+    db = tmp_path / "v2.db"
+    _make_v2_db(db)
+
+    conn = store.connect(db)
+
+    assert store.schema_version(conn) == 3
+    assert _counts(conn) == {
+        "incidents": 1, "surface_forms": 2, "chunk_vectors": 1, "runs": 1, "findings": 1, "tool_calls": 1,
+    }
+    # data written under version 2 is untouched
+    assert conn.execute("SELECT downgrade_reason, stopped_reason FROM findings").fetchone()[:] == ("kept", None)
+    assert conn.execute("SELECT ms_scout, n_written FROM runs").fetchone()[:] == (5, 2)
+    assert store.ref_high_water(conn) == 4
+    # an old incident reads with its one original provenance, and has no history yet
+    inc = store.get_incident(conn, "OMEN-001")
+    assert [(s["learned_by"], s["source"]) for s in inc.sources] == [("seed", None)]
+    assert conn.execute("SELECT COUNT(*) FROM incident_history").fetchone()[0] == 0
+    # and its first change gets a baseline version 1 to revert to
+    store.forget_incident(conn, "OMEN-001")
+    assert [r["action"] for r in store.list_history(conn, "OMEN-001")] == ["create", "forget"]
+
+
+def test_a_failing_version_3_migration_rolls_back_cleanly(tmp_path, monkeypatch):
+    db = tmp_path / "v2.db"
+    _make_v2_db(db)
+    good = [m for m in store.MIGRATIONS if m[0] <= 2]
+    broken_3 = (3, [
+        "ALTER TABLE incidents ADD COLUMN sources TEXT",
+        "CREATE TABLE incident_history (id INTEGER PRIMARY KEY, ref TEXT)",
+        "ALTER TABLE no_such_table ADD COLUMN x TEXT",
+    ])
+    monkeypatch.setattr(store, "MIGRATIONS", [*good, broken_3])
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.connect(db)
+
+    raw = sqlite3.connect(db)
+    raw.row_factory = sqlite3.Row
+    assert "sources" not in _columns(raw, "incidents")  # the first statement was rolled back
+    assert not raw.execute("SELECT name FROM sqlite_master WHERE name = 'incident_history'").fetchall()
+    assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2"
+    assert raw.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
+    raw.close()
+
+    monkeypatch.undo()  # with the real migrations the database upgrades fine afterwards
+    assert store.schema_version(store.connect(db)) == 3
+

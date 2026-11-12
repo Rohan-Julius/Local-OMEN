@@ -23,8 +23,8 @@ a web UI, multi-language scanning or a cloud backend. Those stay out of scope (`
    prompt text count as prompts** (the model sees both: docstrings become tool descriptions, and
    the CLI builds the user messages). Change them only to correct a factual error, and list each
    change in the Progress log.
-4. **Low commit frequency.** One commit per phase (message `phase N: <summary>`). Push only at the
-   three milestones marked **[PUSH]**. One PR to `main` at the end.
+4. **Low commit frequency.** One commit per phase (message `phase N: <summary>`). Push only after
+   Phases 2, 4, 5 and 8 (marked **[PUSH]**). One PR to `main` at the end.
 5. **Two test tiers.** `unit` tests (no model, run everywhere and in CI) and `live` tests (need
    Ollama). Final live verification is done on a GPU machine (RTX 5050), because CPU timings make
    some live tests fail by design of the old budget.
@@ -38,7 +38,7 @@ a web UI, multi-language scanning or a cloud backend. Those stay out of scope (`
 | 1 | Security and correctness | B1, B2, B3, B4, B5, B9, B10, B11 | every listed bug has a failing-then-passing test |
 | 2 | Packaging, config, CI **[PUSH]** | B16, B18, B24, B28, B29, cwd-relative paths | `pip install -e .` gives an `omen` command that works from any directory; CI green |
 | 3 | Trustworthy verdicts | B6, B7, B12, B13, B14, B15, B17 (+ carry-over B30) | evidence citations are validated; audit trail covers both missions |
-| 4 | Memory integrity | B8, B26, schema migrations | dedup merges instead of overwriting; ledger has history; schema is versioned |
+| 4 | Memory integrity **[PUSH]** | B8, B26, history/undo, `doctor`, schema v3 | dedup merges instead of overwriting; ledger has history; schema is versioned |
 | 5 | Reliability and scale **[PUSH]** | B5 part 2 (per-LLM-call timeout), B27, PLAN caps | warm-up + retry; per-call timeouts; `--max-gated`; CPU profile; full suite passes on CPU |
 | 6 | Honest evaluation | B21, threshold tuned on test set | held-out fixture set with reported precision/recall; prompt contamination removed |
 | 7 | Usable outputs | Markdown report, PLAN features | Markdown/JSON/SARIF reports, `--fail-on` exit codes, pre-commit hook |
@@ -140,7 +140,7 @@ directory; CI green on both OSes.
 **Exit criteria:** the CPU scenario from the audit (zero successful tool calls, chunk-line citations)
 can no longer produce `confirmed`; schema migration from Phase 4 or a fresh DB works.
 
-## Phase 4: Memory integrity
+## Phase 4: Memory integrity **[PUSH]**
 
 - **Merge on dedup (B8):** updating an incident keeps existing surface forms and adds new ones
   (de-duplicated), keeps `occurred_on`, and appends provenance instead of overwriting it
@@ -153,6 +153,10 @@ can no longer produce `confirmed`; schema migration from Phase 4 or a fresh DB w
   (delete by `incident_ref`, upsert new ones); `omen reindex` stays the full rebuild.
 - **Integrity check:** `omen doctor` compares SQLite variants with Chroma ids and reports drift;
   also checks Ollama reachability and both models.
+
+**Phase 3 decisions carried into this phase:** `findings.stopped_reason` is stored (schema v3), and
+`PYTHONUTF8=1` is removed from the Windows CI job (Linux keeps it), so Windows encoding bugs like
+B29/B30 show up in CI instead of being masked.
 
 **Exit criteria:** learning a duplicate twice keeps all surface forms from both runs; `omen doctor`
 reports clean after seed/learn/forget sequences.
@@ -168,6 +172,12 @@ reports clean after seed/learn/forget sequences.
   investigations, with skipped chunks reported, never silently dropped.
 - **Hardware profiles:** `--profile gpu|cpu` (or auto-detect via `ollama ps`), where `cpu` raises the
   budget, turns `think` off for the Investigator/Archivist, and lowers `num_ctx` if needed.
+- **CPU time budget and the `slow` marker (Phase 3 decision):** the live tests that Phase 3 ran
+  (Adjudicator, structured runners, tools) took about 40 minutes on CPU, and the Phase 4 Archivist
+  tests add more. State a wall-clock budget for a CPU live run, mark each live test that exceeds a
+  few minutes `slow` (the marker exists since Phase 0 and is applied to the longest ones), and
+  document `pytest -m "live and not slow"` as the quick live tier. `--profile cpu` is what makes the
+  full suite fit the budget.
 - **Batch retrieval:** query Chroma once for all chunks instead of once per chunk.
 - **Graceful errors:** the generic exit-3 one-liner for unexpected errors already exists (Phase 2).
   What is left: a specific, actionable message for **"Ollama down"** (connection refused at
@@ -186,6 +196,15 @@ on the RTX 5050 the demo scan finishes within the `PLAN.md` target (~120 s) and 
 - `omen eval` command: runs retrieval + Triage (+ optional full pipeline) on the held-out set and
   prints precision, recall, and per-stage confusion counts; writes `eval/results-<date>.json`.
 - Record results for both runners and both hardware profiles in `docs/EVALUATION.md`.
+- **Evidence rules in the Adjudicator prompt (Phase 3 decision):** tell the Adjudicator that only
+  `path:line` citations count, and only for the chunk or lines the Investigator actually read (in the
+  live Phase 3 run it put `"grep_symbol({...}) -> []"` in `evidence_lines`, which validation would
+  downgrade). This is a behaviour-changing prompt edit, so make it here, with before/after
+  numbers on the held-out set, not earlier.
+- **Adjudicator hard-negative live test (Phase 3 decision):** the end-to-end HN test returns early
+  whenever Triage rejects, so the Adjudicator is never exercised on a hard negative. Add a live test
+  that feeds a hard-negative chunk and its investigation transcript straight to the Adjudicator
+  (skipping Triage) and asserts it does not confirm.
 
 **Exit criteria:** a held-out table exists with real numbers and their source files; the threshold
 choice is re-justified on calibration data and reported on held-out data.
@@ -239,6 +258,7 @@ Revisit only after Phase 8.
 | 2026-11-12 | 2 | `pytest -m "not live"`: **126 passed, 25 deselected** (151 total; 38 new, 2 moved live → unit); same run with global/system git config hidden (as on CI): 126 passed. Coverage (unit tier) **87%**. `ruff check .`: clean. Live: `tests/test_tools.py` **39 passed**; extra check `test_runners.py -k matches_true_positive` **2 passed** (adk 270 s, direct 165 s, CPU) through the new host plumbing. `omen memory list`: 3.46 s → **1.42 s** (median of 3; ADK no longer imported). Fresh venv `pip install -e .` + run from another directory: `omen --help` 0, `memory list --store` 1 on empty / 0 after `seed`; wheel contains the 5 prompts and the console script. | Fixed: B16, B18, B24, B28, B29; cwd-relative prompts and store. Prompts moved with `git mv` to `omen/prompts/` (git blob ids, file sha256 and loaded-text sha256 identical before/after for all 5); empty unused `prompts/chronicler.txt` removed. **Prompt change (rule 3):** `read_file` tool docstring, `file_path` arg: "relative to the project root" → "relative to the postmortem's own folder" (factual fix after B4). No other prompt, embedding, `incidents.yaml` or fixture change, so calibrate not re-run. `--since` now includes untracked files. `test_demo_repo` Redis check rewritten in Python (no `grep` on Windows CI). CI not yet observed green at time of commit (see push notes). Found: on Windows without long-path support, installing into a deep directory fails on a litellm data file (path > 260 chars); not an Omen bug, document in Phase 8. |
 | 2026-11-12 | 2 (CI) | GitHub Actions run **43195240312** on `production-hardening` (commit `e56c8fd`): **green on both OSes**. ubuntu-latest and windows-latest, Python 3.11: `ruff check .` clean; **126 passed, 25 deselected**; coverage **87%** on both. | Recorded here because the Phase 2 row was written before CI had finished. |
 | 2026-11-12 | 3 | `pytest -m "not live"`: **183 passed, 26 deselected** (209 tests); coverage **91%**; `ruff check .` clean. Run against the Phase 2 code (a temporary worktree of `e56c8fd`), all 25 new or changed tests in the files that can run there failed, the 2 guard tests passed, and `test_evidence.py` (27 tests) and `test_adjudicator.py` fail at import (`omen.evidence`, `adjudicator_schema` do not exist there). Live (CPU): `tests/test_tools.py -m live` **1 passed**; `tests/test_adjudicator.py -m live` **4 passed** in 1282 s: end-to-end TP **confirmed** as OMEN-001 and kept by evidence validation (Investigator stopped on `wall_clock_cap` after 4 successful calls; cited lines 1-3 lie inside its `read_code` 1-50), end-to-end HN passed because Triage ruled NO_MATCH (Investigator/Adjudicator not reached), live structured Adjudicator chose **OMEN-001 over the first-listed OMEN-004 on both runners** (adk 174 s, direct 143 s); `tests/test_runners.py -k structured` **6 passed** in 1136 s (TP, HN, determinism, both runners). `omen calibrate`: unchanged (0.35: TP 4/4, HN 2/4, unrelated 0/4). | Fixed: **B6, B7, B12, B13, B14, B15, B17**; carry-overs **B30** (Sifter UTF-8 and `-z`), empty-ledger exit codes, CI actions v4/v5 → v7, plan edits. Appendix B of the reference doc has no status column, so it is not edited; the fixed IDs are listed here. **B6 decision:** chunk-line citations alone never confirm when the Investigator made no successful tool call (`evidence.validate_confirmed(..., allow_chunk_only=False)`, nothing sets it to True). Schema: version 2 via `meta.schema_version` (`tool_calls.note`, `runs.ms_scout`, `runs.ms_adjudicate`, `runs.n_written`, `findings.downgrade_reason`). Behaviour changes: `scan` on an empty ledger now exits 1 before embedding and records no run (before Phase 3 it exited 0 and recorded an empty run; `test_hardening` updated and moved to the unit tier); `memory list` on an empty ledger exits 0. Test infra: the conftest Ollama probe (1 s, once) marked a busy CPU Ollama unreachable and silently skipped the 6 runner tests on the first attempt; it now tries 3 times with a 5 s timeout, and the rerun above is the reported result. Observed: the live structured Adjudicator put `"grep_symbol({'symbol': 'cache_clear'}) -> []"` in `evidence_lines`; evidence validation would downgrade such a verdict (not a `path:line`). Prompt changes: see below. |
+| 2026-11-12 | 4 | `pytest -m "not live"`: **230 passed, 26 deselected** (256 tests; 47 new); coverage **92%**; `ruff check .` clean. `omen calibrate`: **unchanged** (0.35: TP 4/4, HN 2/4, unrelated 0/4; all 12 per-fixture scores identical). Live (CPU): `tests/test_tools.py -m live` **1 passed** (4.8 s). **The 4 Archivist tests FAILED** — `test_archivist.py::abstracts_and_spans_technologies` 454.5 s, `::dedups_on_second_run` 270.7 s, `test_archivist_git.py::records_pre_change_failure_not_the_fix` 502.2 s, `::git_dedups_on_second_run` 357.6 s — all with "Archivist never wrote an incident". **Cause: B5 part 2 (Phase 5), not a Phase 4 regression**: a diagnostic run of the postmortem scenario with steps printed showed `read_file` ok, `search_memory` ok (5.5 s), then `write_incident` **refused** (`wall-clock ceiling exceeded`) because the model's turn between the two calls took more than the 90 s tool wall clock on CPU; the model then claimed it had recorded the incident. `stopped_reason=wall_clock_cap` and `written_ref=None` ("No incident was written") were reported correctly. Tests and prompts not edited. | Fixed: **B8, B26**; history/undo, `omen doctor`, schema v3. **Merge semantics (B8):** `write_incident` with `existing_ref` calls `store.merge_incident`. Surface forms = union, existing first and never dropped, new ones added in order, de-duplicated on whitespace-collapsed casefolded text, total capped at 12 (a ledger already over 12 keeps all its originals). Kept: title, failure_mechanism, what_happened, the_rule (curated text), `learned_by`/`source` (original provenance). Kept, filled only if blank: severity, occurred_on. Appended: the new source to `incidents.sources` (JSON list; deduplicated on source+learned_by; old rows read as one source). The model's text that was NOT applied is stored in the history row's `proposal`. Why: the ledger is what every later scan is judged against, a model's rephrase of a curated mechanism can move the incident in embedding space and silently change recall, and nothing is lost because the proposal is kept. Defaults I chose beyond the brief: `what_happened` is kept too (it describes the first case, and the second case's text is in `proposal`); `omen seed` still REPLACES (the curated path), writing a history row only if something changed. **History:** table `incident_history(ref, version, ts, action, snapshot JSON, source, proposal)`; actions create/update/forget/**revert** (revert added so an undo is itself undoable); snapshot = full state after the action (for forget: state when forgotten). Incidents written before v3 get a baseline version 1 (stamped with `created_at`) before their first change. **`memory forget` keeps history** (so forgetting is undoable); nothing deletes history. `memory revert <ref>` restores the previous version, or a forgotten incident's state, under the same ref (refs are never reused); `--to N` picks a version; the incident is re-indexed; if Ollama is down the ledger is restored and the message points at `omen doctor --fix`. **Index (B26):** `vectors.reindex_incident` embeds first, then deletes by `incident_ref` and upserts; `omen reindex` stays the full rebuild. Strong test: after seed, write new, merge ×2, forget, revert forgotten, revert merge, merge, forget, the Chroma ids, documents, metadata and vectors equal a full reindex (checked after every step; a mutant that skips the delete is caught). **Doctor:** ledger vs index (missing/stale/extra by variant id and text), Ollama reachability and both models, schema version, ledger size; exit 0 clean / 1 problems; `--fix` = full reindex when drifted; read-only, creates nothing. **Schema v3:** `incident_history`, `incidents.sources`, `findings.stopped_reason` (NULL before). v2→v3 upgrade with data, and a failing v3 rolled back, both tested. **CI:** `PYTHONUTF8` removed from the Windows job (Linux keeps it). Real-embedder check outside pytest (no generation): seed 6 → merge into OMEN-001 → new incident OMEN-007: merge 2.6 s vs full reindex 4.5 s, doctor clean, same 34 ids, min cosine(incremental, full) 1.0, so the incremental path is verified against the real embedding model, though not yet driven by the real LLM (see the Archivist failures). **Incident:** my first doctor tests called `vectors.reindex` before `--store` was applied and emptied the REAL Chroma index in `./omen_store` (the SQLite ledger was untouched); repaired with `omen doctor --fix` (30/30), and `tests/conftest.py` now points every test's default store at a temp dir (autouse). Phase 3 row: already present from the Phase 3 commit, not duplicated. |
 
 ### Phase 3 prompt changes (ground rule 3)
 

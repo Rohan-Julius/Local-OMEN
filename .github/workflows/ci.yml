@@ -17,10 +17,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11"]
+        include:
+          # Linux is UTF-8 anyway. Windows deliberately runs WITHOUT
+          # PYTHONUTF8 (empty = unset), so its legacy code page exposes any
+          # missing `encoding=` in the code, as in B29 and B30. If a
+          # Windows-only encoding failure appears, fix the code, do not add
+          # the variable back.
+          - os: ubuntu-latest
+            pythonutf8: "1"
     env:
       # Belt and braces with omen/vectors.py: Chroma must never phone home.
       ANONYMIZED_TELEMETRY: "FALSE"
-      PYTHONUTF8: "1"
+      PYTHONUTF8: ${{ matrix.pythonutf8 }}
     steps:
       - uses: actions/checkout@v7
 

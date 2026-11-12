@@ -200,7 +200,10 @@ def test_write_incident_updates_when_given_existing_ref(tmp_path, monkeypatch):
     )
     assert same_ref == ref
     incident = store.get_incident(conn, ref)
-    assert incident.title == "Updated title"
+    # Since Phase 4 (audit B8) an update MERGES: curated text is kept, the new
+    # surface form is added (details in tests/test_memory_integrity.py).
+    assert incident.title == "Original title"
+    assert incident.surface_forms == ["form", "form2"]
     assert len(store.list_incidents(conn)) == 1  # updated in place, not duplicated
 
 

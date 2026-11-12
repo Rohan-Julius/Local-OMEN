@@ -5,8 +5,10 @@ around.
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -102,6 +104,24 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE findings ADD COLUMN downgrade_reason TEXT",
         ],
     ),
+    (
+        3,  # Phase 4: incident history and undo (B8), provenance list, finding stop reason
+        [
+            "ALTER TABLE incidents ADD COLUMN sources TEXT",
+            """CREATE TABLE incident_history (
+                 id       INTEGER PRIMARY KEY,
+                 ref      TEXT NOT NULL,
+                 version  INTEGER NOT NULL,
+                 ts       TEXT NOT NULL DEFAULT (datetime('now')),
+                 action   TEXT NOT NULL,
+                 snapshot TEXT NOT NULL,
+                 source   TEXT,
+                 proposal TEXT,
+                 UNIQUE (ref, version)
+               )""",
+            "ALTER TABLE findings ADD COLUMN stopped_reason TEXT",
+        ],
+    ),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -173,7 +193,97 @@ def _row_to_incident(conn: sqlite3.Connection, row: sqlite3.Row) -> Incident:
         learned_by=row["learned_by"] or "seed",
         created_at=row["created_at"],
         surface_forms=[f["form"] for f in forms],
+        sources=_load_sources(row),
     )
+
+
+def _load_sources(row: sqlite3.Row) -> list[dict]:
+    """The `sources` JSON column; for rows written before schema v3 (NULL)
+    the single provenance they always had."""
+    if row["sources"]:
+        return json.loads(row["sources"])
+    return [{"source": row["source"], "learned_by": row["learned_by"] or "seed", "added_at": row["created_at"]}]
+
+
+def _add_source(existing: list[dict], source: str | None, learned_by: str) -> list[dict]:
+    """Append a provenance unless that exact (source, learned_by) is already listed."""
+    if any(s.get("source") == source and s.get("learned_by") == learned_by for s in existing):
+        return [dict(s) for s in existing]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return [*[dict(s) for s in existing], {"source": source, "learned_by": learned_by, "added_at": now}]
+
+
+# ---------------------------------------------------------------------------
+# History: every create / update / forget / revert is a row (production plan
+# Phase 4). `snapshot` is the incident's full state AFTER the action (for a
+# forget: its state at the moment it was forgotten), so any row can be
+# restored by `revert_incident`. `proposal` holds text a merge did not apply.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_FIELDS = (
+    "ref", "kind", "title", "failure_mechanism", "what_happened", "the_rule",
+    "severity", "occurred_on", "source", "learned_by", "created_at",
+)
+MAX_SURFACE_FORMS = 12
+
+
+def incident_snapshot(incident: Incident) -> dict:
+    snap = {f: getattr(incident, f) for f in SNAPSHOT_FIELDS}
+    snap["surface_forms"] = list(incident.surface_forms)
+    snap["sources"] = [dict(s) for s in incident.sources]
+    return snap
+
+
+def _latest_version(conn: sqlite3.Connection, ref: str) -> int | None:
+    row = conn.execute("SELECT MAX(version) AS v FROM incident_history WHERE ref = ?", (ref,)).fetchone()
+    return row["v"]
+
+
+def _record_history(
+    conn: sqlite3.Connection, ref: str, action: str, snapshot: dict, source: str | None,
+    proposal: dict | None = None, ts: str | None = None,
+) -> int:
+    version = (_latest_version(conn, ref) or 0) + 1
+    conn.execute(
+        """INSERT INTO incident_history (ref, version, ts, action, snapshot, source, proposal)
+           VALUES (?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?)""",
+        (ref, version, ts, action, json.dumps(snapshot), source,
+         json.dumps(proposal) if proposal is not None else None),
+    )
+    return version
+
+
+def _ensure_baseline(conn: sqlite3.Connection, incident: Incident) -> None:
+    """An incident written before schema v3 has no history. Before its first
+    change, record its current state as version 1 (stamped with its
+    creation time), so that change has something to be reverted to."""
+    if _latest_version(conn, incident.ref) is None:
+        _record_history(
+            conn, incident.ref, "create", incident_snapshot(incident),
+            incident.source or incident.learned_by, ts=incident.created_at,
+        )
+
+
+def list_history(conn: sqlite3.Connection, ref: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT version, ts, action, source, proposal IS NOT NULL AS has_proposal "
+        "FROM incident_history WHERE ref = ? ORDER BY version",
+        (ref,),
+    ).fetchall()
+
+
+def get_history_snapshot(conn: sqlite3.Connection, ref: str, version: int) -> dict | None:
+    row = conn.execute(
+        "SELECT snapshot FROM incident_history WHERE ref = ? AND version = ?", (ref, version)
+    ).fetchone()
+    return json.loads(row["snapshot"]) if row else None
+
+
+def get_history_proposal(conn: sqlite3.Connection, ref: str, version: int) -> dict | None:
+    row = conn.execute(
+        "SELECT proposal FROM incident_history WHERE ref = ? AND version = ?", (ref, version)
+    ).fetchone()
+    return json.loads(row["proposal"]) if row and row["proposal"] else None
 
 
 def ref_number(ref: str) -> int | None:
@@ -200,20 +310,30 @@ def _bump_ref_high_water(conn: sqlite3.Connection, ref: str) -> None:
 
 
 def upsert_incident(conn: sqlite3.Connection, seed: IncidentSeed) -> Incident:
-    """Insert a new incident or, if `ref` already exists, update it in
-    place and replace its surface forms. Used by both `omen seed` and the
-    Archivist's `write_incident` tool."""
-    existing = conn.execute("SELECT id FROM incidents WHERE ref = ?", (seed.ref,)).fetchone()
-    if existing is None:
+    """Insert a new incident or, if `ref` already exists, REPLACE its
+    fields and surface forms with `seed`'s. This is the curated-input path
+    (`omen seed`, and creating a new incident in `write_incident`). The
+    Archivist updating an existing incident goes through `merge_incident`
+    instead, which does not overwrite curated text (audit B8).
+
+    Writes a history row (`create`, or `update` if anything changed); the
+    provenance list keeps every earlier source and adds this one."""
+    existing = conn.execute("SELECT * FROM incidents WHERE ref = ?", (seed.ref,)).fetchone()
+    before = _row_to_incident(conn, existing) if existing else None
+    if before:
+        _ensure_baseline(conn, before)
+    sources = _add_source(before.sources if before else [], seed.source, seed.learned_by)
+
+    if before is None:
         cur = conn.execute(
             """INSERT INTO incidents
                (ref, kind, title, failure_mechanism, what_happened, the_rule,
-                severity, occurred_on, source, learned_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                severity, occurred_on, source, learned_by, sources)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 seed.ref, seed.kind, seed.title, seed.failure_mechanism,
                 seed.what_happened, seed.the_rule, seed.severity,
-                seed.occurred_on, seed.source, seed.learned_by,
+                seed.occurred_on, seed.source, seed.learned_by, json.dumps(sources),
             ),
         )
         incident_id = cur.lastrowid
@@ -223,12 +343,12 @@ def upsert_incident(conn: sqlite3.Connection, seed: IncidentSeed) -> Incident:
         conn.execute(
             """UPDATE incidents SET
                  kind = ?, title = ?, failure_mechanism = ?, what_happened = ?,
-                 the_rule = ?, severity = ?, occurred_on = ?, source = ?, learned_by = ?
+                 the_rule = ?, severity = ?, occurred_on = ?, source = ?, learned_by = ?, sources = ?
                WHERE id = ?""",
             (
                 seed.kind, seed.title, seed.failure_mechanism, seed.what_happened,
                 seed.the_rule, seed.severity, seed.occurred_on, seed.source,
-                seed.learned_by, incident_id,
+                seed.learned_by, json.dumps(sources), incident_id,
             ),
         )
         conn.execute("DELETE FROM surface_forms WHERE incident_id = ?", (incident_id,))
@@ -237,9 +357,90 @@ def upsert_incident(conn: sqlite3.Connection, seed: IncidentSeed) -> Incident:
         "INSERT INTO surface_forms (incident_id, form) VALUES (?, ?)",
         [(incident_id, form) for form in seed.surface_forms],
     )
+    after = _row_to_incident(conn, conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone())
+    if before is None:
+        _record_history(conn, after.ref, "create", incident_snapshot(after), seed.source or seed.learned_by)
+    elif incident_snapshot(after) != incident_snapshot(before):  # re-seeding unchanged data adds no row
+        _record_history(conn, after.ref, "update", incident_snapshot(after), seed.source or seed.learned_by)
     conn.commit()
-    row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-    return _row_to_incident(conn, row)
+    return after
+
+
+def _norm_form(form: str) -> str:
+    return " ".join(form.split()).casefold()
+
+
+def merge_surface_forms(existing: list[str], proposed: list[str], cap: int = MAX_SURFACE_FORMS) -> list[str]:
+    """The union of two surface-form lists. Existing forms come first and
+    are never dropped (they are the curated ones, even if there are
+    already more than `cap`); proposed forms are added in order, skipping
+    any that equals an earlier form after collapsing whitespace and case,
+    until the list holds `cap` forms."""
+    merged = list(existing)
+    seen = {_norm_form(f) for f in merged}
+    for form in proposed:
+        clean = " ".join(form.split())
+        if not clean or _norm_form(clean) in seen:
+            continue
+        if len(merged) >= cap:
+            break
+        merged.append(clean)
+        seen.add(_norm_form(clean))
+    return merged
+
+
+def merge_incident(conn: sqlite3.Connection, ref: str, seed: IncidentSeed) -> Incident:
+    """The Archivist found a near-duplicate and proposes `seed` as an update
+    to `ref`. Merge, do not overwrite (audit B8):
+
+    - surface forms: union (see `merge_surface_forms`), existing first;
+    - title, failure_mechanism, what_happened, the_rule: KEPT. They are
+      curated text; a model's rephrase must not replace them;
+    - severity, occurred_on: kept; filled from `seed` only if blank;
+    - learned_by / source (the original provenance): kept; `seed`'s source
+      is appended to `sources`.
+
+    The proposed text that was not applied is saved in the history row's
+    `proposal`, so nothing the model wrote is lost. Raises LookupError if
+    `ref` does not exist.
+    """
+    row = conn.execute("SELECT * FROM incidents WHERE ref = ?", (ref,)).fetchone()
+    if row is None:
+        raise LookupError(f"no incident {ref}")
+    before = _row_to_incident(conn, row)
+    _ensure_baseline(conn, before)
+
+    forms = merge_surface_forms(before.surface_forms, seed.surface_forms)
+    conn.executemany(
+        "INSERT INTO surface_forms (incident_id, form) VALUES (?, ?)",
+        [(before.id, f) for f in forms[len(before.surface_forms):]],  # existing are kept in place, in order
+    )
+    conn.execute(
+        "UPDATE incidents SET severity = ?, occurred_on = ?, sources = ? WHERE id = ?",
+        (
+            before.severity or seed.severity,
+            before.occurred_on or seed.occurred_on,
+            json.dumps(_add_source(before.sources, seed.source, seed.learned_by)),
+            before.id,
+        ),
+    )
+    after = _row_to_incident(conn, conn.execute("SELECT * FROM incidents WHERE id = ?", (before.id,)).fetchone())
+
+    unapplied = {
+        k: getattr(seed, k)
+        for k in ("title", "failure_mechanism", "what_happened", "the_rule")
+        if getattr(seed, k) != getattr(before, k)
+    }
+    if unapplied:
+        unapplied["surface_forms"] = list(seed.surface_forms)
+        unapplied["severity"] = seed.severity
+    if unapplied or incident_snapshot(after) != incident_snapshot(before):
+        _record_history(
+            conn, ref, "update", incident_snapshot(after), seed.source or seed.learned_by,
+            proposal=unapplied or None,
+        )
+    conn.commit()
+    return after
 
 
 def seed_from_yaml(conn: sqlite3.Connection, yaml_path: Path) -> list[Incident]:
@@ -258,15 +459,81 @@ def get_incident(conn: sqlite3.Connection, ref: str) -> Incident | None:
     return _row_to_incident(conn, row) if row else None
 
 
-def forget_incident(conn: sqlite3.Connection, ref: str) -> bool:
+def forget_incident(conn: sqlite3.Connection, ref: str, source: str = "omen memory forget") -> bool:
     """Delete an incident and its surface forms (cascades via FK). This is
     the undo for autonomous memory writes (PLAN.md: "omen memory forget").
-    The ref's number is retired, never reassigned (audit B11)."""
-    cur = conn.execute("DELETE FROM incidents WHERE ref = ?", (ref,))
-    if cur.rowcount > 0:
-        _bump_ref_high_water(conn, ref)
+    The ref's number is retired, never reassigned (audit B11).
+
+    History is KEPT: a `forget` row snapshots the incident as it was, so
+    forgetting is itself undoable with `revert_incident` (production plan
+    Phase 4). Nothing in Omen deletes history."""
+    row = conn.execute("SELECT * FROM incidents WHERE ref = ?", (ref,)).fetchone()
+    if row is None:
+        return False
+    before = _row_to_incident(conn, row)
+    _ensure_baseline(conn, before)
+    conn.execute("DELETE FROM incidents WHERE ref = ?", (ref,))
+    _bump_ref_high_water(conn, ref)
+    _record_history(conn, ref, "forget", incident_snapshot(before), source)
     conn.commit()
-    return cur.rowcount > 0
+    return True
+
+
+def revert_incident(conn: sqlite3.Connection, ref: str, to: int | None = None) -> tuple[Incident, int]:
+    """Restore `ref` from a history snapshot. Returns (incident, version
+    restored). Works on a forgotten incident too: it comes back under the
+    same ref (refs are never reused, so the number is still free).
+
+    Default target: for an existing incident, the version before its latest
+    change (undo the last change); for a forgotten one, its state when
+    forgotten. `to` names a version explicitly. The revert is itself
+    recorded as a new history row, so it can be undone too. The caller
+    must re-index the returned incident (`vectors.reindex_incident`).
+
+    Raises LookupError if there is no such history, ValueError if there is
+    nothing earlier to go back to.
+    """
+    latest = _latest_version(conn, ref)
+    if latest is None:
+        raise LookupError(f"no history for {ref}")
+    row = conn.execute("SELECT * FROM incidents WHERE ref = ?", (ref,)).fetchone()
+    if to is None:
+        target = latest if row is None else latest - 1
+        if target < 1:
+            raise ValueError(f"{ref} has no earlier version to revert to (use `omen memory forget` to remove it)")
+    else:
+        target = to
+    snap = get_history_snapshot(conn, ref, target)
+    if snap is None:
+        raise LookupError(f"{ref} has no version {target}")
+
+    fields = [snap[f] for f in ("kind", "title", "failure_mechanism", "what_happened", "the_rule",
+                                "severity", "occurred_on", "source", "learned_by")]
+    if row is None:
+        cur = conn.execute(
+            """INSERT INTO incidents (ref, kind, title, failure_mechanism, what_happened, the_rule,
+                                      severity, occurred_on, source, learned_by, created_at, sources)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ref, *fields, snap["created_at"], json.dumps(snap["sources"])),
+        )
+        incident_id = cur.lastrowid
+    else:
+        incident_id = row["id"]
+        conn.execute(
+            """UPDATE incidents SET kind = ?, title = ?, failure_mechanism = ?, what_happened = ?, the_rule = ?,
+                                    severity = ?, occurred_on = ?, source = ?, learned_by = ?, sources = ?
+               WHERE id = ?""",
+            (*fields, json.dumps(snap["sources"]), incident_id),
+        )
+        conn.execute("DELETE FROM surface_forms WHERE incident_id = ?", (incident_id,))
+    conn.executemany(
+        "INSERT INTO surface_forms (incident_id, form) VALUES (?, ?)",
+        [(incident_id, f) for f in snap["surface_forms"]],
+    )
+    after = _row_to_incident(conn, conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone())
+    _record_history(conn, ref, "revert", incident_snapshot(after), f"revert to v{target}")
+    conn.commit()
+    return after, target
 
 
 # ---------------------------------------------------------------------------
@@ -329,14 +596,14 @@ def record_finding(conn: sqlite3.Connection, finding) -> int:
         """INSERT INTO findings
            (run_id, incident_ref, file_path, start_line, end_line, symbol,
             similarity, verdict, code_mechanism, reasoning, evidence,
-            confidence, tool_calls, downgrade_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            confidence, tool_calls, downgrade_reason, stopped_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             finding.run_id, finding.incident_ref, finding.file_path,
             finding.start_line, finding.end_line, finding.symbol,
             finding.similarity, finding.verdict, finding.code_mechanism,
             finding.reasoning, finding.evidence, finding.confidence,
-            finding.tool_calls, finding.downgrade_reason,
+            finding.tool_calls, finding.downgrade_reason, finding.stopped_reason,
         ),
     )
     conn.commit()

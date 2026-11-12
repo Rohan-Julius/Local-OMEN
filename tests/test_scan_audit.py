@@ -143,6 +143,7 @@ async def test_b6_cpu_case_all_tool_calls_refused_is_not_confirmed(scan_env):
     f = only_finding(conn)
     assert f["verdict"] == "unverified"
     assert "no successful tool call" in f["downgrade_reason"]
+    assert f["stopped_reason"] == "wall_clock_cap"
     assert conn.execute("SELECT n_confirmed FROM runs").fetchone()[0] == 0
 
 
@@ -213,6 +214,7 @@ async def test_b12_b13_tool_call_notes_are_persisted_and_the_cap_is_reported(sca
     assert notes[2] == "error"
     assert "tool calls exceeded" in notes[3]
     assert "stopped_reason=call_cap" in capsys.readouterr().out  # was "model_finished" because text existed
+    assert only_finding(conn)["stopped_reason"] == "call_cap"  # and it is stored with the finding (schema v3)
 
 
 @pytest.mark.asyncio
