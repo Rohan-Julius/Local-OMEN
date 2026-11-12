@@ -1,7 +1,8 @@
 """The only place models are named (PLAN.md chokepoint table: "12B -> E4B
 on OOM" should be a one-line change here). Also owns the Ollama runtime
 flags discovered during Phase 0 that are load-bearing for latency and
-correctness on this specific GPU — see README.md "Phase 0 results".
+correctness on this specific GPU — see CLAUDE.md "Critical Ollama/GPU quirks".
+(The original Phase 0 measurements are in git history: README.md at commit 65f46e6.)
 """
 from __future__ import annotations
 
@@ -83,9 +84,11 @@ CHROMA_COLLECTION = "incidents"
 
 # Librarian (Phase 3). SIMILARITY_THRESHOLD chosen by Phase 4's fixture
 # sweep: 4/4 true positives survive, 2/4 hard negatives survive (the
-# PLAN.md acceptance bar) — see README.md "Phase 4 results" for the sweep
-# and why the margin (0.344 rejected vs 0.360 weakest true positive) is
-# real but tight.
+# PLAN.md acceptance bar). The sweep is in docs/PRODUCTION_PLAN.md ("Phase 0
+# calibration sweep") and is reproduced by `omen calibrate`; the margin
+# (0.343 strongest rejected hard negative vs 0.360 weakest true positive) is
+# real but tight. The sweep is over fixtures/calibration.yaml (the tuning
+# set); results on fixtures/heldout.yaml are reported by `omen eval`.
 EMBED_BATCH_SIZE = 32
 QUERY_N_RESULTS = 6  # variant-level; collapsed to incidents before capping
 TOP_K_INCIDENTS = 3

@@ -22,6 +22,6 @@ omen_store/chroma/
 # --from-git`), nested inside this one. Ignoring only its .git/ keeps its
 # *files* tracked normally by the outer repo without turning it into an
 # embedded gitlink/submodule.
+# A fresh clone has the files but not that history: `python scripts/build_demo_repo.py`
+# recreates it.
 demo_repo/.git/
-
-CLAUDE.md

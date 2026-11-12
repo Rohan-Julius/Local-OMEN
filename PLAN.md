@@ -4,6 +4,39 @@
 
 ---
 
+## As-built status (added in production-hardening Phase 8)
+
+This plan is the original design. It was written before anything was built, so some lines no longer match the code. The
+code wins. Each row below says what happened; the same notes are tagged inline in the sections they affect. "Phase N" means
+a phase of `docs/PRODUCTION_PLAN.md`. The `A` numbers are the items of Appendix A in `docs/complete info about project.md`.
+
+| Plan says | As built | |
+|---|---|---|
+| Build on a Mac, demo on the RTX 5050; dev model Gemma 4 E4B | **Not as planned.** Dev and demo are one Windows RTX 5050 laptop; the 12B model is used throughout | A9 |
+| `num_ctx` 8192, KV cache `q8_0` | **`NUM_CTX = 4096`** (8192 does not fit fully on the GPU); `OLLAMA_KV_CACHE_TYPE` use is not recorded | A8 |
+| EmbeddingGemma "q8 (~300MB)" | The installed tag is BF16, 621 MB | A10 |
+| Embedder unloaded with `keep_alive: 0` | **Not built.** No `keep_alive` is sent | A11 |
+| `--fast`, `--no-persona` | **Not built** | A12 |
+| `--max-gated` cap of 8, "max 2 positives" | **Built in phase 5** (`--max-gated`, `--max-positives`; skipped chunks are reported and stored) | A13 |
+| Chronicler role | **Not built** (stretch; the empty `prompts/chronicler.txt` was removed in phase 2) | A14 |
+| Constructor-level assertion that no agent has both tools and `output_schema` | **Not built.** Only the structure of `agents.py` keeps them apart | A15 |
+| `Literal` enums for tool parameters | **Not built.** Plain `str` / `int` parameters | A16 |
+| `search_memory` returns `REF — title — mechanism` | The separator is ` - ` (ASCII hyphen) | A17 |
+| "The 7 tool functions" | **Eight** distinct functions (`search_memory` is shared by three tool sets) | A18 |
+| `runs.mission` is `scan` or `learn`; `tool_calls` is the audit trail | **Built in phase 3**: learn runs and their tool calls are persisted | A19 |
+| Disagreement becomes `unverified`, "reported separately" | **Partly built**: `unverified` is also produced by evidence validation (phase 3), and since phase 7 it is its own level in the markdown, JSON and SARIF reports and in `--fail-on` | A20 |
+| Chroma "one batched query" | **Built in phase 5** | A21 |
+| Stream the reasoning to the terminal live | **Not built.** Only tool calls stream | A22 |
+| `--retrieval-only` in "~2s" | Measured 6.6 s warm on the CPU test machine before phase 2, mostly import time; not re-measured on the GPU | A23 |
+| Warm-up call at startup (`CLAUDE.md` quirk 3) | **Built in phase 5** (`omen/warmup.py`, one retry) | A24 |
+| Markdown report ("deferred") | **Built in phase 7**, with JSON and SARIF (`omen/render.py`) | |
+| `prompts/` at the repository root | Moved to `omen/prompts/` in phase 2 (package data) | |
+| Fixture set of 12, calibration only | Split in phase 6 into `fixtures/calibration.yaml` and a held-out `fixtures/heldout.yaml`; `omen eval` | |
+| `demo_repo` has its own nested git history | The history is not in the repository (`.git` is ignored); `scripts/build_demo_repo.py` rebuilds a reconstruction (phase 8) | A6 |
+| Optional LLM triage stage in the Sifter; `kind='rule'` stretch; web UI | **Not built**, by design | |
+
+---
+
 ## Context
 
 **The problem.** A codebase forgets. A team hits an incident, writes a postmortem, fixes it — and eighteen months later someone reintroduces the same failure mode written a different way. Linters can't catch it: the knowledge isn't a generic best practice, it's *this team's specific history*. Grep can't catch it either, because the second occurrence rarely reuses the first one's vocabulary.
@@ -24,7 +57,7 @@ The four track capabilities, and the specific mechanism that delivers each. Writ
 
 | Capability | Mechanism | Where |
 |---|---|---|
-| **Reason** | Mechanism-level equivalence judgment: the agent states what the code can do wrong *before* ruling on whether that matches a past incident. Reasoning trace is streamed live. | Triage, Adjudicator |
+| **Reason** | Mechanism-level equivalence judgment: the agent states what the code can do wrong *before* ruling on whether that matches a past incident. Reasoning trace is streamed live **[not built: only tool calls stream; A22]**. | Triage, Adjudicator |
 | **Use tools** | Four local tools in the scan mission (`read_code`, `grep_symbol`, `search_memory`, `get_incident`), three in the learn mission. The agent decides which to call, in what order, and when it has enough. | Investigator, Archivist |
 | **Retain memory** | SQLite ledger + Chroma index — and the agent **writes its own memories** via two input paths: a curated postmortem, or **raw git history with no human-written summary at all**. Includes dedup against what it already knows. Memory is read *and* written by the agent. | `omen learn`, `omen learn --from-git`, `write_incident` |
 | **Automate multi-step tasks** | Two end-to-end missions. The tool loops are agent-terminated, not fixed-length: the agent decides when the investigation is complete. | Both missions |
@@ -37,10 +70,10 @@ The four track capabilities, and the specific mechanism that delivers each. Writ
 
 | Decision | Choice | Why |
 |---|---|---|
-| Dev vs demo host | Build on Mac, demo on RTX 5050 (8GB, Blackwell) | Drives the Ollama choice |
-| LLM | Gemma 4 12B Q4_K_M, `num_ctx` 8192, KV cache `q8_0` | ~6.6GB; best reasoning in budget |
-| Dev model | Gemma 4 **E4B** on the Mac | Inherits native function calling from the 31B; iterating a 12B on Metal would eat the day |
-| Embedder | EmbeddingGemma 308M, q8 (~300MB) | Purpose-built on-device; strong on code retrieval |
+| Dev vs demo host | Build on Mac, demo on RTX 5050 (8GB, Blackwell) **[not as built: one Windows RTX 5050 machine for both; A9]** | Drives the Ollama choice |
+| LLM | Gemma 4 12B Q4_K_M, `num_ctx` 8192, KV cache `q8_0` **[as built: `num_ctx` 4096, which fits fully on the GPU; A8]** | ~6.6GB; best reasoning in budget |
+| Dev model | Gemma 4 **E4B** on the Mac **[not used: the 12B is used everywhere; A9]** | Inherits native function calling from the 31B; iterating a 12B on Metal would eat the day |
+| Embedder | EmbeddingGemma 308M, q8 (~300MB) **[as built: BF16 tag, 621 MB; A10]** | Purpose-built on-device; strong on code retrieval |
 | Runtime | Ollama for both | Identical HTTP API on Metal and CUDA |
 | Agent framework | **Google ADK**, `LlmAgent` per role via `LiteLlm("ollama_chat/…")` | Google's own agent tooling; behind a strategy interface so it stays reversible |
 | Tool calling | **Gemma 4 native function calling**, non-streaming | 86.4% on τ²-bench vs Gemma 3's 6.6%. Non-streaming avoids a known client-side `tool_calls` parsing bug |
@@ -49,7 +82,7 @@ The four track capabilities, and the specific mechanism that delivers each. Writ
 | Chunk cache | SQLite content-hash table (not Chroma) | Exact-key lookup, never a similarity search |
 | Scan scope | Local `git diff` default, `--all` opt-in | Platform-agnostic *and* fast |
 | Chunking | Python `ast` only | Exact function/class boundaries, zero deps |
-| Model residency | Sequential phases; embedder unloaded before generation | Satisfies "one model at a time" by pipeline design |
+| Model residency | Sequential phases; embedder unloaded before generation **[not built: no `keep_alive` is sent; A11]** | Satisfies "one model at a time" by pipeline design |
 
 ---
 
@@ -101,8 +134,8 @@ Three design problems, and they're the substance of this feature.
 | **Triage** | ADK `LlmAgent`, `output_schema`, no tools | — | Fast structured ruling on every gated chunk. Cheap, no tool round trips |
 | **Investigator** | ADK `LlmAgent`, **tools**, no `output_schema` | `read_code`, `grep_symbol`, `search_memory`, `get_incident` | Only on Triage positives. Autonomously gather evidence until satisfied |
 | **Adjudicator** | ADK `LlmAgent`, `output_schema`, no tools | — | Final verdict from the investigation transcript, **blind to Triage's reasoning** |
-| **Chronicler** | ADK `LlmAgent` | — | Rewrite confirmed findings in persona |
-| **Scribe** | pure Python | — | Persist to SQLite; render progress, terminal, and markdown reports |
+| **Chronicler** **[not built; A14]** | ADK `LlmAgent` | — | Rewrite confirmed findings in persona |
+| **Scribe** | pure Python | — | Persist to SQLite; render progress, terminal, and markdown reports **[markdown, JSON and SARIF built in phase 7: `omen/render.py`]** |
 
 ### Why triage-then-investigate, rather than tools everywhere
 
@@ -139,7 +172,7 @@ Four details that matter:
 
 **No agent has both `tools` and `output_schema`.** ADK documents that combination as supported only on specific models (Gemini 3.0 class), and its recommended remedy is to split output formatting into a separate agent. That is precisely the Investigator → Adjudicator split — so the framework constraint and the design agree rather than fight.
 
-**Tool sets are scoped per mission *and per input path*, never pooled.** Three sets, each at most four tools: scan (`read_code`, `grep_symbol`, `search_memory`, `get_incident`), learn-from-postmortem (`read_file`, `search_memory`, `write_incident`), learn-from-git (`read_commit`, `read_diff`, `search_memory`, `write_incident`). Small-model tool-routing accuracy degrades as tool count grows, and reported Gemma 4 tool failures are mostly prompt/schema architecture rather than model weakness. Handing one agent all seven would be the easy mistake here. So: few tools per agent, `Literal` enums over free strings, every field marked required, and a one-line description on each parameter.
+**Tool sets are scoped per mission *and per input path*, never pooled.** Three sets, each at most four tools: scan (`read_code`, `grep_symbol`, `search_memory`, `get_incident`), learn-from-postmortem (`read_file`, `search_memory`, `write_incident`), learn-from-git (`read_commit`, `read_diff`, `search_memory`, `write_incident`). Small-model tool-routing accuracy degrades as tool count grows, and reported Gemma 4 tool failures are mostly prompt/schema architecture rather than model weakness. Handing one agent all seven would be the easy mistake here. So: few tools per agent, `Literal` enums over free strings **[not built: plain `str`/`int` parameters; A16]**, every field marked required, and a one-line description on each parameter.
 
 **Embeddings never touch ADK or LiteLLM.** The Librarian calls Ollama's `/api/embed` directly. Routing 34 embedding calls through an agent framework adds layers with nothing to gain.
 
@@ -160,6 +193,8 @@ class DirectOllamaRunner: ...   # ollama client: format=schema, and native tools
 
 ### Tools
 
+(As built there are **eight** distinct tool functions, not seven; A18.)
+
 All four are pure local Python — no network, and instant. The only cost is the LLM round trip that requests them.
 
 ```python
@@ -170,7 +205,7 @@ def grep_symbol(symbol: str) -> list[str]:
     """Find definitions and call sites of a symbol. Returns 'path:line: text'."""
 
 def search_memory(query: str) -> list[str]:
-    """Semantic search the incident ledger. Returns 'REF — title — mechanism'."""
+    """Semantic search the incident ledger. Returns 'REF — title — mechanism'."""  # as built: the separator is ' - ' (A17)
 
 def get_incident(incident_ref: str) -> str:
     """Full record for one incident: mechanism, what happened, the rule."""
@@ -200,6 +235,8 @@ def write_incident(...) -> str:
 
 ### Model residency
 
+**[Not built as drawn: no `keep_alive: 0` is sent, so the embedding model is left to Ollama's own unloading policy; A11.]**
+
 The one-model constraint dictates the topology rather than being worked around.
 
 ```
@@ -222,9 +259,9 @@ Every rung produces a useful report. Ordered by what to shed first.
 | Mode | What runs | Time |
 |---|---|---|
 | default | full agentic pipeline with tools | ~90–120s |
-| `--fast` | Triage only, no tool loop | ~40s |
-| `--no-persona` | drops the Chronicler | −10s |
-| `--retrieval-only` | Librarian output as a ranked candidate list, zero generation | ~2s |
+| `--fast` **[not built; A12]** | Triage only, no tool loop | ~40s |
+| `--no-persona` **[not built; A12]** | drops the Chronicler | −10s |
+| `--retrieval-only` | Librarian output as a ranked candidate list, zero generation | ~2s **[measured 6.6 s warm on the CPU test machine before phase 2, mostly import time; A23]** |
 
 `--retrieval-only` is the on-stage safety net: if generation misbehaves live, it still demonstrates semantic retrieval ranking the right incident.
 
@@ -371,9 +408,9 @@ Estimates to validate in phase 0, not facts.
 |---|---|---|---|
 | Model load (cold) | 5–15s | one-time | keep warm; pre-warm before demo |
 | Embed | ~1–3s / 300 chunks | linear in changed chunks | hash cache → ~0 on re-scan |
-| Chroma KNN | <50ms, one batched query | sub-linear; fine to 10k+ incidents | none needed |
-| Triage | ~8s × gated chunks | **linear — capped at 8** | `--max-gated`; short `num_predict` |
-| **Investigator** | **~20–40s × positives** | **the wall: unbounded agent loop** | **max 6 tool calls, max 2 positives, wall-clock ceiling** |
+| Chroma KNN | <50ms, one batched query **[built in phase 5; A21]** | sub-linear; fine to 10k+ incidents | none needed |
+| Triage | ~8s × gated chunks | **linear — capped at 8** | `--max-gated` **[built in phase 5; A13]**; short `num_predict` |
+| **Investigator** | **~20–40s × positives** | **the wall: unbounded agent loop** | **max 6 tool calls, max 2 positives [`--max-positives`, built in phase 5; A13], wall-clock ceiling** |
 | Adjudicator | ~10s × positives | linear in positives (few) | only runs on investigated chunks |
 | Chronicler | ~10s, once | constant | skipped when no findings |
 
@@ -407,14 +444,15 @@ omen/
 │   ├── config.py       # ONLY place models are named. 12B→E4B is one line
 │   ├── agents.py       # ONLY place google.adk is imported. The 5 LlmAgents
 │   ├── runners.py      # RoleRunner protocol + ADKRoleRunner + DirectOllamaRunner
-│   ├── tools.py        # the 7 tool functions + path confinement + call caps
+│   ├── tools.py        # the 8 tool functions (the plan said 7; A18) + path confinement + call caps
 │   ├── store.py        # SQLite: ledger, cache, runs, findings, tool_calls
 │   ├── vectors.py      # ONLY place chromadb is imported. Owns distance→similarity
 │   ├── scout.py        # git scope resolution + ast chunking
 │   ├── librarian.py    # embed (cached, direct /api/embed) + query + collapse + gate
 │   ├── archivist.py    # the learn mission
-│   └── report.py       # progress lines, terminal + markdown reports
-├── prompts/            # triage, investigator, adjudicator, chronicler, archivist
+│   └── report.py       # progress lines, terminal summary (markdown/JSON/SARIF: render.py, phase 7)
+├── prompts/            # triage, investigator, adjudicator, chronicler, archivist  [as built: omen/prompts/, no chronicler]
+#   modules added after this plan: errors, profiles, warmup, evidence, doctor, evaluation, render, sifter, fixtures; see docs/complete info about project.md §20
 ├── incidents.yaml      # the seeded ledger
 ├── postmortems/        # raw markdown for `omen learn` to consume
 ├── fixtures/           # labeled chunks + expected verdicts
@@ -509,7 +547,7 @@ Pure Python, no LLM — so this is fast and fully testable before any agent depe
 - `agents.py`: Triage (`output_schema`, no tools) and Investigator (tools, non-streaming, no `output_schema`).
 - `runners.py`: both implementations. Wire `DirectOllamaRunner` now even if the spike said ADK is fine — it's ~20 lines and it's the difference between a five-minute recovery and a dead end.
 - Prompts: mechanism before verdict; `NO_MATCH` declared as default; two worked hard negatives; required evidence lines.
-- Investigator loop driven by the orchestrator: run, execute requested tools, feed results back, repeat until the agent stops asking or a cap trips. **Stream the reasoning and tool calls to the terminal live.**
+- Investigator loop driven by the orchestrator: run, execute requested tools, feed results back, repeat until the agent stops asking or a cap trips. **Stream the reasoning and tool calls to the terminal live.** **[As built only the tool calls stream; A22.]**
 
 *Acceptance:* fixture set through Triage; record precision/recall. Watch one investigation end-to-end and confirm the tool choices are sensible, not random. Temperature 0 gives identical Triage verdicts across runs.
 
@@ -517,7 +555,7 @@ Pure Python, no LLM — so this is fast and fully testable before any agent depe
 
 - Own prompt, own `output_schema`. Receives the chunk, the incident, and the **investigation transcript** — with Triage's reasoning and verdict stripped out.
 - Empty `evidence_lines` on a positive → auto-downgraded in code.
-- Agreement → `confirmed`; disagreement → `unverified`, reported separately, never silently dropped.
+- Agreement → `confirmed`; disagreement → `unverified`, reported separately, never silently dropped. **[As built: `unverified` comes from evidence validation (phase 3) and is a separate level in the phase 7 reports; there is no Triage-vs-Adjudicator "disagreement" report; A20.]**
 
 *Acceptance:* fixture precision improves or holds vs. phase 6. Assert the assembled prompt contains neither Triage's `reasoning` nor its verdict — a string assertion, because a leak looks like success from the outside.
 
@@ -548,7 +586,7 @@ Only ~45 min of genuinely new work, because the Archivist role, dedup, write, re
 
 Compressed to fund phase 8b. The Chronicler persona pass moves to stretch — see the revised cut list.
 
-- Report: per-role progress with live timings, terminal summary, persistence. **Terminal only; markdown report deferred.** Screen and DB timings come from the same measurements, so they cannot disagree.
+- Report: per-role progress with live timings, terminal summary, persistence. **Terminal only; markdown report deferred** [built in phase 7]. Screen and DB timings come from the same measurements, so they cannot disagree.
 - `demo_repo/`: ~5 files of plausible Python service code containing exactly **one true positive** (same mechanism as a learned incident, different library, no shared vocabulary — `functools.lru_cache` on a permission lookup) and **one hard negative** (a genuine cache, "cache" all over the identifiers, mechanically unrelated — caching a static response body), plus ~3 ordinary files.
 
 *Acceptance:* full scan renders progress, tool calls, and a finding naming the incident ref, file, line span, and mechanism. `grep -ri redis demo_repo/` returns nothing and the scan still flags the right chunk.
@@ -565,7 +603,7 @@ Compressed to fund phase 8b. The Chronicler persona pass moves to stretch — se
 The schedule is now genuinely full — 8b takes it to 7:35 with 25 minutes of slack. Cuts, in order:
 
 1. **The Chronicler persona pass** — already moved to stretch. Findings render fine without a voice.
-2. **Markdown report** — already deferred; terminal only.
+2. **Markdown report** — already deferred; terminal only. **[Built later, in production-hardening phase 7, with JSON and SARIF.]**
 3. **Phase 8b entirely.** If you reach 6:50 without 8a passing acceptance, ship postmortem-only and say so plainly in the writeup: you implemented memory *formation*, not LORE's fully-automatic *acquisition*. That's an honest, defensible scope statement — a half-working git path is not.
 4. **`--fast` as the default** — drops the Investigator from the scan path. Tools stay in the repo and stay honest to describe.
 5. **`--runner=direct`** — drops ADK from execution, keeps `agents.py` as the described architecture.
@@ -600,14 +638,14 @@ The loop is the point. A tool that only *reads* a memory is a linter with extra 
 - **Tool-loop bounds.** Assert the caps trip: a chunk that keeps requesting tools stops at 6 calls, duplicate calls hit the cache, and the wall-clock ceiling fires. An unbounded agent loop is the one bug that can hang a live demo.
 - **Path confinement.** `read_code("../../.ssh/id_rsa", 1, 5)` must be rejected.
 - **Adjudicator independence.** Assert the assembled prompt contains neither Triage's `reasoning` nor its verdict.
-- **No agent has both tools and `output_schema`.** A constructor-level assertion, guarding the documented ADK incompatibility so it surfaces as a clear error rather than confusing schema failures.
+- **No agent has both tools and `output_schema`.** A constructor-level assertion, guarding the documented ADK incompatibility so it surfaces as a clear error rather than confusing schema failures. **[Not built; only the structure of `agents.py` keeps them apart; A15.]**
 - **Memory formation.** `omen learn` twice on the same postmortem creates one incident, not two. Its surface forms mention at least one technology absent from the source.
 - **Git-path inversion (the one that matters most for 8b).** Given a commit that *adds* an invalidation call, assert the resulting `failure_mechanism` describes the **missing** invalidation, not the added one. A memory that records the fix instead of the failure is worse than no memory, and it will read as plausible unless specifically checked.
 - **Sifter precision.** On the demo repo's constructed history, the deterministic prefilter must reduce N commits to ≤3 candidates and must reject the decoy commits (version bumps, typo fixes, test additions).
 - **Cross-commit dedup.** Two commits in one range addressing the same underlying failure must yield one incident. This is the test that catches reindex-at-the-end instead of reindex-per-write.
 - **Undo.** `omen memory forget <ref>` removes the entry from SQLite *and* its variants from Chroma; a subsequent scan no longer matches it.
 - **`--dry-run` writes nothing.** Assert row counts in `incidents` and the Chroma collection are unchanged after a dry run.
-- **Network isolation.** Full pipeline, both missions, interface disabled. The only real proof of end-to-end locality with `google-adk`, `litellm`, and `chromadb` in the stack.
+- **Network isolation.** **[Partly built: `tests/test_hardening.py` proves agent construction opens no socket and `tests/test_vectors.py` covers Chroma; a full network-off end-to-end run has not been done.]** Full pipeline, both missions, interface disabled. The only real proof of end-to-end locality with `google-adk`, `litellm`, and `chromadb` in the stack.
 - **Chroma integrity.** Delete the Chroma directory, `omen reindex` from SQLite, confirm findings unchanged — proves SQLite is genuinely the source of truth.
 - **Determinism.** Temperature 0; identical Triage verdicts across runs.
 - **Latency.** `ms_total` under 120s full, under 45s `--fast`, under 20s warm on re-scan.

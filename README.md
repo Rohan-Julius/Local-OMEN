@@ -3,225 +3,338 @@
 [![CI](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml/badge.svg?branch=production-hardening)](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml)
 
 Omen is a local, agentic system that turns your team's own incident history
-into a standing set of code reviewers. You teach it about past failures —
-either by pointing it at a postmortem or letting it read straight from git
-history — and it remembers the *mechanism* behind each one, not just the
-file or the fix. Point it at a codebase afterward and it flags new code that
-is quietly set up to fail the same way, with cited evidence for why.
+into a standing set of code reviewers. You teach it about past failures,
+either by pointing it at a postmortem or by letting it read straight from git
+history, and it remembers the *mechanism* behind each one, not just the file or
+the fix. Point it at a codebase afterward and it flags new code that is quietly
+set up to fail the same way, with cited evidence for why.
 
 Two commands, one idea:
 
-- `omen learn <postmortem.md>` / `omen learn --from-git <range>` — turn a
-  written postmortem, or raw commit history, into a durable, technology-
-  agnostic memory of a failure.
-- `omen scan <path>` — check a codebase (or just a diff) against every
-  memory learned so far, and explain — with mechanism, reasoning, and
-  evidence — why a chunk of code repeats one.
+- `omen learn <postmortem.md>` / `omen learn --from-git <range>` turn a written
+  postmortem, or raw commit history, into a durable, technology-agnostic memory
+  of a failure.
+- `omen scan <path>` checks a codebase (or just a diff) against every memory
+  learned so far, and explains, with mechanism, reasoning and evidence, why a
+  chunk of code repeats one.
 
-Everything runs on-device against a local Gemma model served by
-[Ollama](https://ollama.com/); nothing is sent to a third-party API.
+Everything runs on your machine against a Gemma model served by
+[Ollama](https://ollama.com/). Nothing is sent to a third-party API.
+
+> **Status.** All planned features of the scan and learn missions work, and the
+> branch has been hardened for production use (see `CHANGELOG.md`). Live results
+> on this branch come from a **CPU run**; a final run on the GPU machine is
+> still pending (`docs/PRODUCTION_PLAN.md`, "Pending live verification"). Python
+> only; one Gemma model; no web UI.
 
 ## Why a local model
 
-**Privacy.** The whole point of Omen is to read your code — full source
-files, diffs, and the incident postmortems that describe how something went
-wrong internally. That's exactly the kind of material a team can't casually
-ship to a third-party API: proprietary logic, security-sensitive code paths,
-and post-incident writeups that may describe an outage or a vulnerability in
-detail. Running Gemma locally via Ollama means none of it ever leaves the
-machine — there's no API call to a hosted model, no vendor logging, no data
-retention policy to trust.
+**Privacy.** Omen reads your source code and the postmortems that describe how
+something went wrong internally: proprietary logic, security-sensitive paths,
+detailed outage write-ups. Running Gemma through Ollama means none of it leaves
+the machine: no hosted API, no vendor logging, no retention policy to trust.
 
-**Cost.** Omen's scan pipeline can call the model several times per code
-chunk (a fast structured pass, then a multi-step tool-calling investigation,
-then a final adjudication), and a `learn` run adds a further tool-calling
-pass per postmortem or commit. Against a hosted per-token API, iterating on
-prompts or scanning a large codebase repeatedly gets expensive fast. Against
-a local model, once the weights are downloaded, every call is free — so the
-pipeline can afford to be thorough (multiple judging stages, an agentic
-investigation loop) in a way that would be cost-prohibitive to run per-token
-in the cloud.
+**Cost.** A scan can call the model several times per code chunk (a fast
+structured pass, a tool-calling investigation, a final adjudication). Against a
+per-token API that gets expensive quickly; against a local model every call is
+free once the weights are downloaded, so the pipeline can afford to be thorough.
 
-## Setup
+## Install
 
-Prerequisites: Python 3.11, and [Ollama](https://ollama.com/) installed and
-running.
+You need Python 3.11 or 3.12, [Ollama](https://ollama.com/) installed and
+running, and about 8 GB of GPU memory for the 12B model (or patience: see
+[CPU and GPU profiles](#cpu-and-gpu-profiles)).
 
 ```
-git clone <this-repo>
-cd Local-lore
+git clone <this-repo> Local-OMEN
+cd Local-OMEN
 
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+py -3.11 -m venv .venv          # Windows; elsewhere: python3.11 -m venv .venv
+.venv\Scripts\activate          # elsewhere: source .venv/bin/activate
+pip install -e .                # add ".[dev]" for tests and the linter
 
 ollama pull gemma4:12b-it-q4_K_M
 ollama pull embeddinggemma
 ```
 
-Load the starter incident ledger and build its vector index:
+`pip install -e .` gives an `omen` command that works from any directory.
+`python -m omen.cli ...` is equivalent. Running Windows? Install into a
+**short path** (see [Troubleshooting](#troubleshooting)).
+
+Check the setup:
 
 ```
-python -m omen.cli seed incidents.yaml
-python -m omen.cli reindex
-python -m omen.cli memory list
+omen doctor
 ```
 
-You should see the seeded incidents printed with their refs (`OMEN-001`,
-`OMEN-002`, ...). From here you can teach it a new incident or scan a repo:
+(After step 1 of the quick start below, `doctor` reports on your ledger, your
+vector index, Ollama and both models.)
+
+## Quick start
+
+From the repository root:
 
 ```
-python -m omen.cli learn postmortems/some-incident.md
-python -m omen.cli scan path/to/a/repo
+omen seed incidents.yaml        # load the six starter incidents into the ledger
+omen reindex                    # build the vector index from the ledger
+omen memory list                # OMEN-001 ... OMEN-006
+
+omen scan demo_repo --all       # scan the bundled example service
 ```
 
-`omen scan` defaults to diffing the working tree; pass a directory and
-`--all` to scan every tracked file instead of just what's changed.
+The demo scan should confirm `permissions.py` as a repeat of `OMEN-001` (a cached
+permission check with no invalidation on revoke) and not flag
+`cache/response_cache.py`, a real cache that has nothing to do with authorization.
 
-### Try it against the bundled example
-
-`demo_repo/` is a small, self-contained example service (its own git repo,
-nested inside this one) with a planted true positive — a
-`functools.lru_cache`'d permission check with no invalidation on revoke,
-sharing OMEN-001's mechanism with no shared vocabulary at all (no Redis, no
-TTL) — and a hard negative: a genuine cache, `cache` in every identifier,
-mechanically unrelated (it caches a static response body, nothing
-authorization-related). It also has its own small commit history, including
-one real fix commit and a handful of decoys, for trying `omen learn
---from-git` end to end:
+Teach it something new:
 
 ```
-python -m omen.cli scan demo_repo --all
-python -m omen.cli learn --from-git HEAD --repo demo_repo --dry-run   # drop --dry-run to actually learn
+omen learn postmortems/2025-08-14-cross-request-user-leak.md
+
+python scripts/build_demo_repo.py                       # once: recreate demo_repo's git history
+omen learn --from-git HEAD --repo demo_repo --dry-run   # drop --dry-run to actually learn
 ```
 
-### GPU notes
+`demo_repo/` is a small example service with a planted true positive and a hard
+negative. Its own git history is not in a clone (it is a nested repository that
+the main repository ignores). `scripts/build_demo_repo.py` rebuilds a seven-commit
+reconstruction: one real fix and decoy commits for the prefilter to reject. It
+never touches an existing `demo_repo/.git`.
 
-If you're running on a GPU-constrained card, model loading matters: Ollama
-can silently split the model across CPU/GPU and tank throughput unless it's
-told to keep the whole model resident on GPU. `omen/config.py` is the one
-place model and runtime flags (`NUM_GPU`, `NUM_CTX`, `THINK_DEFAULT`) live —
-adjust there if you're on different hardware.
+Scan only what you changed, and get a report a machine can read:
+
+```
+omen scan --since HEAD --format sarif --output omen.sarif --fail-on confirmed
+```
+
+## CPU and GPU profiles
+
+Omen picks limits and `think` settings from a **hardware profile**:
+
+| | `gpu` | `cpu` |
+|---|---|---|
+| Typical structured call | about 7 s (RTX 5050) | 110 to 170 s (i7 laptop) |
+| One model generation may take | 120 s | 600 s |
+| One investigation may take | 90 s | 1800 s |
+| Time spent inside tools | 60 s | 120 s |
+| Investigator and Archivist `think` | on | off |
+
+Choose with `--profile gpu|cpu|auto` or the `OMEN_PROFILE` environment variable.
+`auto` (the default) asks Ollama whether the model is on the GPU, after a warm-up
+call; if it cannot tell, it assumes `gpu` and says so. **On a CPU-only machine,
+always pass `--profile cpu`** (or set `OMEN_PROFILE=cpu`): with the GPU limits a
+slow model turn can use up an investigation's time.
+
+Two settings matter on a GPU. Omen always passes `num_gpu=999`, because without
+it Ollama silently splits the model across CPU and GPU and throughput collapses
+(about 5 tokens/s). It uses `num_ctx=4096`, which fits fully on an 8 GB card;
+8192 does not. The first model call after Ollama starts can crash the CUDA
+backend and then succeed on retry, so every command that uses the model makes a
+throwaway warm-up call first (with one retry; skip it with `--no-warmup`). All of
+these live in `omen/config.py` and `omen/profiles.py`.
+
+A CPU scan of the demo repo took about 28 minutes in the last measured run; a
+GPU scan is aimed at about two minutes (`PLAN.md`; not measured on this branch).
 
 ## Commands
 
-All commands go through `python -m omen.cli <command>`.
+All commands accept `--store DIR` (default: `$OMEN_HOME`, else `./omen_store`),
+`--profile`, `-v/--verbose` and `-q/--quiet`.
 
 | Command | What it does |
 |---|---|
-| `omen seed <incidents.yaml>` | Loads a YAML file of incidents into the SQLite ledger. Used once to bootstrap a starter memory set. |
-| `omen reindex` | Rebuilds the Chroma vector index from SQLite (embeds every incident's mechanism + surface forms). SQLite is always the source of truth; Chroma is a derived index you can throw away and rebuild any time. |
-| `omen memory list` | Lists every incident currently in the ledger, with its ref and how it was learned. |
-| `omen memory forget <ref>` | Deletes an incident from both SQLite and the vector index. This is the undo for a bad `omen learn` run. |
-| `omen learn <postmortem.md>` | Reads a postmortem file and forms a new memory (or updates a near-duplicate one) from it. |
-| `omen learn --from-git <range>` | Reads raw commit history (e.g. `HEAD~40..HEAD`) instead of a postmortem: a deterministic prefilter narrows the range to a handful of candidate commits, then each one is turned into a memory the same way. `--repo <path>` picks which repo to read history from (default: the current directory); supports `--max-commits`, `--max-learn`, and `--dry-run` (prefilter only, writes nothing). |
-| `omen scan <path>` | Runs the full investigation pipeline against everything currently in memory and prints a verdict per flagged chunk. `--dry-run` stops after chunking (no embeddings, no model calls); `--retrieval-only` stops after showing ranked candidate incidents (no generation). `--since <rev>` diffs against a specific ref instead of the working tree; `--all` scans the whole tracked tree. |
-| `omen calibrate` | Sweeps the retrieval similarity threshold over a labeled fixture set and prints where true positives stop surviving and hard negatives start getting rejected. A tuning tool for `SIMILARITY_THRESHOLD` in `config.py`, not part of the normal learn/scan workflow. |
+| `omen seed <incidents.yaml>` | Load a YAML file of incidents into the ledger (replaces an incident with the same ref). Run `omen reindex` after. |
+| `omen reindex` | Rebuild the Chroma vector index from SQLite (the full rebuild; writes during `learn` update only the changed incident). |
+| `omen doctor [--fix]` | Check the store: does the index match the ledger (missing, stale or extra entries), is Ollama reachable, are both models pulled, schema version, ledger size. `--fix` rebuilds a drifted index. Exit 0 healthy, 1 problems. |
+| `omen memory list` | List incidents with their ref and how they were learned. |
+| `omen memory show <ref>` | One incident in full: mechanism, rule, surface forms, every source it has had. |
+| `omen memory history <ref>` | Its create/update/forget/revert history. |
+| `omen memory revert <ref> [--to N]` | Undo its last change, or bring back a forgotten incident. |
+| `omen memory forget <ref>` | Remove an incident from the ledger and the index. Its history is kept, so `revert` restores it. |
+| `omen learn <postmortem.md>` | Form a memory from a postmortem, or merge into a near-duplicate. `--allow-dir DIR` widens the folder the model may read (default: the postmortem's own folder). |
+| `omen learn --from-git <range>` | Form memories from raw git history (e.g. `HEAD~40..HEAD`). A deterministic prefilter (message patterns, reverts, sensitive paths) picks candidates first. `--repo`, `--max-commits`, `--max-learn`, `--dry-run`. |
+| `omen scan [path]` | Run the full pipeline. `--since REV` (diff against a ref), `--all` (whole tree), `--dry-run` (chunk table only), `--retrieval-only` (ranked candidates, no generation), `--max-gated N` (default 8), `--max-positives N` (default 2), `--runner adk\|direct`, and the report options below. |
+| `omen calibrate` | Sweep the similarity floor over `fixtures/calibration.yaml`. A tuning tool. |
+| `omen eval` | Measure retrieval, Triage and (with `--full`) the whole pipeline on the held-out `fixtures/heldout.yaml`; prints precision and recall and writes `eval/results-<date>.json`. See `docs/EVALUATION.md`. |
+
+**Outside the checkout.** `omen seed`, `omen calibrate` and `omen eval` read files
+you name, and the repository's `incidents.yaml` and `fixtures/` are not installed
+with the package. Run from a clone, or pass the paths: `omen seed
+/path/to/incidents.yaml`, `omen calibrate --fixtures-path /path/to/calibration.yaml`,
+`omen eval --fixtures-path /path/to/heldout.yaml`. Prompts are packaged and need no path.
 
 ### How they fit together
 
-`learn` and `scan` are two ends of the same memory. `learn` is the only
-thing that writes to the ledger — every `write_incident` call it makes
-immediately re-embeds and rebuilds the vector index, so a freshly learned
-incident is retrievable by the very next `scan` without a manual `reindex`.
-`seed` and `reindex` exist to bootstrap and repair that same ledger by hand
-(load a starter set, or rebuild the index after editing SQLite directly).
-`memory list`/`forget` let you inspect and undo what's in there. `calibrate`
-is a standalone tuning loop against a fixture file, independent of the real
-ledger. In short: `seed`/`learn` put memories in, `reindex` keeps the index
-honest, `scan` reads against it, and `memory` lets you see and undo what's
-stored.
+`learn` and `seed` both write to the ledger. `learn` re-embeds only the incident
+it changed, so a freshly learned incident is found by the very next `scan`. `seed`
+loads a curated file; `reindex` and `doctor --fix` repair the index; `memory`
+lets you inspect and undo what is stored. `calibrate` and `eval` are measurement
+tools and never change the ledger.
+
+## Outputs and exit codes
+
+`omen scan --format text|markdown|json|sarif [--output FILE] [--fail-on confirmed|unverified]`
+
+| Format | For |
+|---|---|
+| `text` (default) | A person at a terminal: live progress, then a summary |
+| `markdown` | A pull-request comment or wiki page |
+| `json` | Scripts (entries are exactly the `Finding` model) |
+| `sarif` | GitHub code scanning and other SARIF 2.1.0 viewers (a rule per incident, a result per confirmed or unverified finding, evidence in the message) |
+
+For everything except `text`, stdout carries only the document; progress goes to
+stderr. Details, the pre-commit hook and an example workflow for a self-hosted GPU
+runner are in [`docs/OUTPUTS.md`](docs/OUTPUTS.md).
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success (with `--fail-on`: nothing at or above the level) |
+| 1 | User error: bad arguments, a missing file, an unknown ref, an empty ledger |
+| 2 | `--fail-on` found a finding at or above the level |
+| 3 | Runtime or model error: Ollama down, a model not pulled, a timeout |
+
+Pre-commit, in `.pre-commit-config.yaml` (needs a running Ollama and a seeded ledger):
+
+```yaml
+repos:
+  - repo: https://github.com/<org>/Local-OMEN
+    rev: <tag-or-commit>
+    hooks:
+      - id: omen-scan          # runs: omen scan --since HEAD --fail-on confirmed
+```
+
+Every run is also recorded in SQLite (`runs`, `findings`, `tool_calls`,
+`skipped_chunks`), including the tool-call audit trail of each investigation.
 
 ## Agent architecture
 
-Omen runs one Gemma model, loaded once, with different prompts swapped in
-per role — it isn't several separate models. Each role is a distinct agent
-with a narrow job; the *order* they run in is fixed, ordinary Python, but
-each individual role is free to reason and (for two of them) call tools
-within its own turn.
+Omen runs one Gemma model, loaded once, with different prompts swapped in per
+role. The *order* of the stages is fixed, ordinary Python; each role is free to
+reason, and two of them to call tools, within its own turn.
 
 ### Learning a memory (`omen learn`)
 
-1. **Sifter** *(git input only)* — a deterministic, no-LLM prefilter over a
-   commit range. It flags commits by message pattern (`fix`, `revert`,
-   `regression`, ...), revert detection, and touches to sensitive paths
-   (auth, cache, payment, permission code), cutting a large range down to a
-   handful of real candidates before any model call happens.
-2. **Archivist** — reads either the postmortem file or a candidate commit's
-   diff, and does the actual memory formation. Its central discipline is
-   **abstraction**: it writes the failure down as a technology-agnostic
-   *mechanism* ("a permission cache has no invalidation path tied to the
-   revocation event"), not as a description of the specific library or
-   framework involved — otherwise the memory could only ever match code
-   that happens to use the same stack. For the git-history path specifically,
-   it has to reconstruct the failure from the code's state *before* the fix
-   commit, not describe the fix itself — a fix commit shows the remedy, not
-   the bug. Before writing, it checks the existing ledger for a near-duplicate
-   (`search_memory`) and updates that entry instead of creating a redundant
-   one.
+1. **Sifter** *(git input only)*: a deterministic, no-LLM prefilter. It flags
+   commits by message pattern (`fix`, `revert`, `regression`, ...), by revert
+   detection and by touches to sensitive paths (auth, cache, payment,
+   permission), cutting a range to a handful of candidates before any model call.
+2. **Archivist**: reads the postmortem or a candidate commit's diff and forms the
+   memory. Its central discipline is **abstraction**: it records the failure as a
+   technology-agnostic *mechanism*, not as the specific library involved. For git
+   input it reconstructs the failure from the code *before* the fix, since a fix
+   commit shows the remedy, not the bug. Before writing it searches memory for a
+   near-duplicate and, if it finds one, **merges** into it: existing surface forms
+   are kept, new ones added, the original provenance kept and the new source
+   appended. Every change is recorded in the incident's history.
 
 ### Scanning a codebase (`omen scan`)
 
-1. **Scout** — pure Python, no model. Resolves what's in scope (a diff, a
-   ref range, or the whole tree) and chunks each file by AST into
-   function/method/class-sized pieces the rest of the pipeline can reason
-   about individually.
-2. **Librarian** — embeds each chunk, queries the vector index for
-   similar incident mechanisms, collapses hits down to one candidate per
-   incident, and gates out anything below a calibrated similarity floor.
-   Also pure Python — no generation, just retrieval.
-3. **Triage** — the first model judgment. A fast, tool-free structured
-   verdict (`MATCH` / `NO_MATCH`) on whether a chunk's own failure mechanism
-   — reasoned independently, before comparing to the incident — actually
-   matches a retrieved candidate, as opposed to just sharing surface
-   vocabulary. Retrieval is deliberately generous, so Triage's default
-   assumption is `NO_MATCH`; it only escalates chunks it can state a
-   concrete mechanical reason for.
-4. **Investigator** — runs only on Triage's `MATCH` chunks. This is the
-   agentic step: it has tools (`read_code`, `grep_symbol`, `search_memory`,
-   `get_incident`) to check things a single chunk can't show on its own —
-   is there a mitigation elsewhere in the file, is this code actually
-   reachable on the path the incident cares about. It doesn't rule
-   MATCH/NO_MATCH itself; it produces an evidence-backed transcript for the
-   next stage to judge.
-5. **Adjudicator** — the final verdict: `confirmed`, `rejected`, or
-   `unverified`. Deliberately blind to Triage's reasoning and verdict — it
-   sees only the chunk, the candidate incidents, and the Investigator's
-   transcript, so it can't just rubber-stamp the first stage's opinion. A
-   `confirmed` verdict with no cited evidence lines is automatically
-   downgraded to `unverified` in code, never left to the model's judgment.
+1. **Scout** (pure Python): resolves scope (uncommitted changes including staged
+   and untracked files, `--since REV`, or `--all`) and chunks files by AST into
+   function-sized pieces.
+2. **Librarian** (pure Python plus the embedding model): embeds chunks, queries
+   the index in one batch, collapses hits to one candidate per incident and drops
+   anything below the calibrated similarity floor (0.35).
+3. **Triage**: a fast, tool-free structured verdict (`MATCH` / `NO_MATCH`) on
+   whether the chunk's own failure mechanism matches a candidate, not just its
+   vocabulary. The default is `NO_MATCH`.
+4. **Investigator**: runs only on Triage positives (at most `--max-positives`).
+   It has tools (`read_code`, `grep_symbol`, `search_memory`, `get_incident`) and
+   gathers evidence; it does not rule on the match.
+5. **Adjudicator**: the final verdict, `confirmed`, `unverified` or `rejected`,
+   from the chunk, the candidates and the investigation transcript only. It never
+   sees Triage's reasoning. In code, a `confirmed` verdict must cite `path:line`
+   evidence that lies in the chunk or in lines the Investigator actually read, and
+   the Investigator must have made at least one successful tool call; otherwise it
+   is downgraded to `unverified` with the reason recorded.
 
-Findings and run metadata are recorded to SQLite as the scan runs (visible
-via the tables `runs`, `findings`, and `tool_calls`, the latter giving a
-full audit trail of every tool call made during an investigation); a
-rendered report beyond the terminal summary isn't built yet.
+Chunks that clear retrieval but exceed a cap are reported and stored, never
+silently dropped.
 
 ### Two execution backends
 
-Every role runs through a `RoleRunner` interface with two interchangeable
-implementations, selectable per-command with `--runner={adk,direct}`:
-`ADKRoleRunner` (Google's Agent Development Kit) is the default, and
-`DirectOllamaRunner` talks to Ollama directly as a fallback if ADK's
-structured-output or tool-calling path misbehaves. Both are fully
-implemented and tested equally, not one real path and one stub.
+Every role runs through a `RoleRunner` interface with two implementations,
+chosen with `--runner adk|direct`: `ADKRoleRunner` (Google's Agent Development
+Kit, the default) and `DirectOllamaRunner` (talks to Ollama directly; a fallback if
+ADK's structured-output or tool path misbehaves). Both are exercised by the live
+runner contract tests (`tests/test_runners.py`) and by the Adjudicator's structured
+call; most other live tests use ADK only, and the unit tests use scripted fake
+runners for both.
 
 ### Data model
 
-SQLite is the source of truth for everything durable: incidents (with their
-abstracted mechanism and concrete surface forms), a hash-cache of computed
-embeddings, run records, findings, and the tool-call audit trail. Chroma
-holds only a derived vector index for semantic retrieval — it's rebuilt
-from SQLite by `omen reindex` and never written to directly, so it can be
-deleted and regenerated at any time without losing anything.
+SQLite is the source of truth: incidents with their abstracted mechanism and
+surface forms, an incident history, a hash cache of chunk embeddings, run records,
+findings and the tool-call audit trail. The schema is versioned and migrated on
+open. Chroma holds only a derived vector index; it is rebuilt from SQLite by
+`omen reindex` and can be deleted and regenerated at any time.
 
-## Testing
+## Testing and evaluation
 
 ```
-pytest                     # full suite; most tests need a reachable Ollama instance
-pytest tests/test_scout.py # fast, no model required
+ruff check .
+pytest -m "not live"              # unit tier: no model needed, runs in CI
+pytest -m "live and not slow"     # quick live tier (needs Ollama)
+pytest -m live                    # full live tier
 ```
 
-Tests that require live inference are written that way deliberately —
-prompt quality for a system like this can't be meaningfully verified with
-mocks, so most of the suite exercises the real model rather than stubbing
-it out.
+The unit tests use scripted fake runners and fake embedders. Prompt quality can
+only be checked against the real model, so the live tier exists and is part of the
+release checklist (`CONTRIBUTING.md`). Detection quality is measured on a held-out
+fixture set that is never used for tuning: see [`docs/EVALUATION.md`](docs/EVALUATION.md)
+(its results table is still to be filled by a GPU run).
+
+## Troubleshooting
+
+**Install fails on Windows with a "path too long" error** (typically on a data
+file inside `litellm`). Windows limits paths to 260 characters unless long paths
+are enabled, and Omen's dependencies have deep trees. Either create the virtual
+environment at a short path (for example `C:\omen\.venv`), or enable long paths
+(Windows 10 and later: `LongPathsEnabled` = 1 under
+`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`, plus
+`git config --system core.longpaths true`) and install again.
+
+**`omen seed`, `calibrate` or `eval` says a file is not found.** They take explicit
+paths when you run outside the checkout; see
+[Commands](#commands). `omen scan` and `omen memory` use `--store` / `OMEN_HOME` (default
+`./omen_store` in the **current** directory, so run from the same place each time or
+set `OMEN_HOME`).
+
+**`omen doctor` says the index has drifted** (missing, stale or extra entries):
+the vector index no longer matches the ledger, for example after editing the
+database by hand. `omen doctor --fix` rebuilds the index from the ledger (it needs
+Ollama for the embeddings). Exit code 0 means healthy; 1 means a problem remains
+(drift, Ollama unreachable or a model not pulled).
+
+**`error: Ollama is not reachable at ...`** (exit 3): start it with `ollama serve`,
+or set `OLLAMA_HOST` if it runs elsewhere (one address is used for every call).
+
+**`error: model ... not found; run ollama pull ...`** (exit 3): pull the named model.
+
+**Everything is very slow, or `llm_timeout` / "timed out" appears.** You are
+probably on a CPU. Use `--profile cpu` (or `OMEN_PROFILE=cpu`), expect minutes per
+model call, and consider `--max-gated` and `--max-positives` to bound a scan.
+
+**The first call fails with "CUDA error" or "llama-server process has
+terminated".** A known first-call crash after an Ollama restart. Omen's warm-up
+retries once; if it still fails, run any `ollama run` once and try again.
+
+**`error: the incident ledger is empty`** (exit 1): run `omen seed incidents.yaml`
+then `omen reindex`.
+
+**A scan reports "skipped N chunk(s) because of caps".** Chunks beyond
+`--max-gated` were not triaged and Triage positives beyond `--max-positives` were
+not investigated; they are listed and stored in `skipped_chunks`. Raise the caps to
+process them.
+
+## Documentation
+
+| File | What |
+|---|---|
+| `CHANGELOG.md` | What changed on this branch, phase by phase |
+| `docs/OUTPUTS.md` | Report formats, exit codes, pre-commit, CI example |
+| `docs/EVALUATION.md` | How detection quality is measured, and the results table |
+| `docs/PRODUCTION_PLAN.md` | The hardening plan, the progress log and the pending live checks |
+| `docs/complete info about project.md` | A long reference for the whole project |
+| `PLAN.md` | The original design (see its "As-built status") |
+| `SECURITY.md`, `CONTRIBUTING.md` | Threat model and reporting; tests, calibration rule, commit policy |

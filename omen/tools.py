@@ -1,4 +1,6 @@
-"""The 7 tool functions (PLAN.md), plus the orchestrator-side budget that
+"""The 8 distinct tool functions (PLAN.md said 7; `search_memory` is shared by three sets, and
+`read_code`, `grep_symbol`, `get_incident`, `read_file`, `read_commit`, `read_diff` and
+`write_incident` make eight), plus the orchestrator-side budget that
 enforces the three hard caps on an agent's tool loop: max total calls, a
 duplicate-call cache, and a wall-clock ceiling. Pure Python, no LLM — every
 tool here is callable from a REPL with no model running (Phase 5).

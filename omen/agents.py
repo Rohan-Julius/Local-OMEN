@@ -35,7 +35,7 @@ _session_ids = itertools.count(1)
 def _model(think: bool) -> LiteLlm:
     # PLAN.md "ollama_chat/, never ollama/" — and num_gpu/num_ctx/think are
     # the Phase 0 findings that are load-bearing for latency/correctness
-    # on this GPU (see README "Phase 0 results"). api_base: the one
+    # on this GPU (see CLAUDE.md "Critical Ollama/GPU quirks"). api_base: the one
     # configured Ollama address (B16), not LiteLLM's built-in default.
     return LiteLlm(
         model=f"ollama_chat/{LLM_MODEL}",

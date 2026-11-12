@@ -4,10 +4,12 @@ grep -ri redis demo_repo/ returns nothing and the scan still flags the
 right chunk." Includes the negative control: the hard negative
 (cache/response_cache.py) must never come back confirmed.
 
-Live Ollama required (skips gracefully without it) — this drives the full
-Scout -> Librarian -> Triage -> Investigator -> Adjudicator pipeline
-against the real `demo_repo/`, against an isolated store seeded from the
-real `incidents.yaml` (never the live on-disk ledger/Chroma index).
+The scan test is marked `live` (needs Ollama; it is skipped one test at a
+time when Ollama is unreachable) and drives the full Scout -> Librarian ->
+Triage -> Investigator -> Adjudicator pipeline against the real `demo_repo/`,
+against an isolated store seeded from the real `incidents.yaml` (never the
+live on-disk ledger/Chroma index). The Redis check needs no model and runs
+everywhere, CI included.
 """
 import argparse
 from pathlib import Path
@@ -47,8 +49,10 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 def _scan_args() -> argparse.Namespace:
-    # --all: demo_repo's working tree has no uncommitted diff (everything
-    # is committed), so the default `git diff` scope would scan nothing.
+    # --all: scan every file. The default scope is the uncommitted diff,
+    # and a clean checkout of demo_repo has none, so it would scan nothing.
+    # (In a clone demo_repo is part of the OUTER repository; its own nested
+    # history comes from scripts/build_demo_repo.py and is not needed here.)
     return argparse.Namespace(
         path=str(DEMO_REPO), since=None, all=True, dry_run=False, retrieval_only=False, runner="adk"
     )

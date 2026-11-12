@@ -10,7 +10,9 @@ elsewhere (test_triage.py, test_runners.py, test_adjudicator.py); this
 file's job is only to prove the Scribe half — that `runs`, `findings`,
 and `tool_calls` actually get populated from one scan. The embedding call
 is faked too (`_fake_embeddings`), so these tests need no Ollama and run
-in the unit tier and in CI.
+in the unit tier and in CI (none of these tests is marked `live`; the
+module-level skip that used to hide them when Ollama was down, audit B19,
+was removed in Phase 0).
 """
 import argparse
 import time

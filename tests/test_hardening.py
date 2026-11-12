@@ -9,7 +9,9 @@ automate and expensive to discover live on the demo machine.
   messages, no tracebacks").
 
 Nothing here needs a live Ollama connection: agent construction makes no
-call, and an empty-ledger scan now stops before embedding anything.
+call, and an empty-ledger scan stops before embedding anything. None of
+these tests is marked `live`, so they run in the unit tier and in CI (since
+Phase 0 the old module-level skip, audit B19, no longer hides them).
 """
 from __future__ import annotations
 
