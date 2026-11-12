@@ -37,7 +37,17 @@ class CommitCandidate:
 
 
 def _run_git(repo_path: Path, args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo_path), *args], capture_output=True, text=True)
+    # git writes commit messages and paths as UTF-8. Decoding with the
+    # locale (cp1252 on Windows) mangled them, and for some bytes failed
+    # outright, leaving stdout None and crashing `learn --from-git`
+    # (audit B30, same root cause as Scout's B29).
+    return subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def _log_range(repo_path: Path, commit_range: str, max_commits: int) -> list[tuple[str, str, str]]:
@@ -64,8 +74,14 @@ def _log_range(repo_path: Path, commit_range: str, max_commits: int) -> list[tup
 
 
 def _changed_paths(repo_path: Path, sha: str) -> list[str]:
-    result = _run_git(repo_path, ["show", "--name-only", "--format=", sha])
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    """Paths changed by `sha`. `-z`: NUL-separated and never quoted, so a
+    non-ASCII path is the real path, not git's `"na\303\257ve/..."` form
+    (audit B30)."""
+    result = _run_git(repo_path, ["show", "-z", "--name-only", "--format=", sha])
+    # Only newlines are stripped (git emits one after the empty --format=
+    # header); spaces can be part of a real filename.
+    paths = (p.strip("\n") for p in result.stdout.split("\0"))
+    return [p for p in paths if p]
 
 
 def _select_reason(subject: str, body: str, paths: list[str]) -> str | None:

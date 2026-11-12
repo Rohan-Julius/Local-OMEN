@@ -37,7 +37,7 @@ a web UI, multi-language scanning or a cloud backend. Those stay out of scope (`
 | 0 | Baseline and test tiers | B19, B20 | `pytest -m "not live"` runs everywhere; baseline numbers recorded |
 | 1 | Security and correctness | B1, B2, B3, B4, B5, B9, B10, B11 | every listed bug has a failing-then-passing test |
 | 2 | Packaging, config, CI **[PUSH]** | B16, B18, B24, B28, B29, cwd-relative paths | `pip install -e .` gives an `omen` command that works from any directory; CI green |
-| 3 | Trustworthy verdicts | B6, B7, B12, B13, B14, B15, B17 | evidence citations are validated; audit trail covers both missions |
+| 3 | Trustworthy verdicts | B6, B7, B12, B13, B14, B15, B17 (+ carry-over B30) | evidence citations are validated; audit trail covers both missions |
 | 4 | Memory integrity | B8, B26, schema migrations | dedup merges instead of overwriting; ledger has history; schema is versioned |
 | 5 | Reliability and scale **[PUSH]** | B5 part 2 (per-LLM-call timeout), B27, PLAN caps | warm-up + retry; per-call timeouts; `--max-gated`; CPU profile; full suite passes on CPU |
 | 6 | Honest evaluation | B21, threshold tuned on test set | held-out fixture set with reported precision/recall; prompt contamination removed |
@@ -84,6 +84,11 @@ model turn no longer uses up the budget, but every model turn after the first to
 counts against it. On CPU a slow second turn can still get the next tool call refused. The second
 half is in Phase 5 ("B5 part 2").
 
+**Found during Phase 2 review (B30):** `sifter.py` read git output with the locale encoding and without
+`-z`, like Scout before B29. On Windows a commit subject with certain UTF-8 bytes made decoding fail,
+`stdout` came back `None` and `learn --from-git` crashed; non-ASCII changed paths came back in git's
+quoted form. Fixed in Phase 3 (carry-over).
+
 **Found during Phase 1 (B29):** Scout drops `.py` files with non-ASCII names in every scope, because
 git quotes such paths (`"caf\303\251.py"`) and the quoted line no longer ends in `.py`. Fixed in
 Phase 2.
@@ -92,7 +97,7 @@ Phase 2.
 
 - Add `pyproject.toml`: package metadata, Python `>=3.11,<3.13`, dependencies (pin `google-genai`
   explicitly, B24), console script `omen = omen.cli:entrypoint`, optional `[dev]` extras
-  (pytest, pytest-asyncio, ruff, mypy, pytest-cov). Keep `requirements.txt` as a lock-style pin list.
+  (pytest, pytest-asyncio, ruff, pytest-cov). Keep `requirements.txt` as a lock-style pin list.
 - Ship prompts as package data (`omen/prompts/`), loaded with `importlib.resources`, so the CLI works
   from any directory. Keep a top-level `prompts/` symlink or remove it and update docs.
 - Store location: `OMEN_HOME` env var / `--store` flag, default `./omen_store` (backwards compatible).
@@ -106,7 +111,7 @@ Phase 2.
   `--verbose` / `--quiet`.
 - CI: `.github/workflows/ci.yml` on push/PR: Python 3.11 on ubuntu and windows, `pip install -e .[dev]`,
   `ruff check`, `pytest -m "not live" --cov=omen`. Add the badge to the README.
-- Add `ruff` config (and `mypy` on `omen/contracts.py`, `omen/tools.py`, `omen/store.py` to start).
+- Add `ruff` config. (mypy moved to Phase 8, optional.)
 - **B29:** Scout reads git paths unquoted (`-z` output) in every scope; test with a non-ASCII
   filename.
 - `--since` includes untracked files too (same de-duplicated union as the default scope).
@@ -141,9 +146,9 @@ can no longer produce `confirmed`; schema migration from Phase 4 or a fresh DB w
   (de-duplicated), keeps `occurred_on`, and appends provenance instead of overwriting it
   (`sources` list or an `incident_history` table with the previous row as JSON).
 - **History and undo:** `omen memory show <ref>`, `omen memory history <ref>`, `omen memory revert <ref>`.
-- **Schema versioning:** build it on the existing `meta` table (added in Phase 1 for the B11 ref
-  high-water mark): a `schema_version` key + a small ordered migration list in `store.py`; tests
-  that migrate an old-format DB (including one with no `meta` table).
+- **Schema versioning:** extend the minimal ordered migration list that Phase 3 adds to `store.py`
+  (driven by a `schema_version` key in the existing `meta` table, added in Phase 1 for the B11 ref
+  high-water mark); tests that migrate an old-format DB (including one with no `meta` table).
 - **Incremental reindex (B26):** `write_incident` re-embeds only the changed incident's variants
   (delete by `incident_ref`, upsert new ones); `omen reindex` stays the full rebuild.
 - **Integrity check:** `omen doctor` compares SQLite variants with Chroma ids and reports drift;
@@ -164,8 +169,10 @@ reports clean after seed/learn/forget sequences.
 - **Hardware profiles:** `--profile gpu|cpu` (or auto-detect via `ollama ps`), where `cpu` raises the
   budget, turns `think` off for the Investigator/Archivist, and lowers `num_ctx` if needed.
 - **Batch retrieval:** query Chroma once for all chunks instead of once per chunk.
-- **Graceful errors:** Ollama down, model missing, or a schema-invalid reply produce a one-line
-  message and exit code 3, not a traceback. One retry for a schema-invalid structured reply.
+- **Graceful errors:** the generic exit-3 one-liner for unexpected errors already exists (Phase 2).
+  What is left: a specific, actionable message for **"Ollama down"** (connection refused at
+  `OLLAMA_HOST`) and **"model missing"** (name the `ollama pull` to run), and **one retry for a
+  schema-invalid structured reply** before giving up.
 
 **Exit criteria:** with `--profile cpu`, the full test suite (including live) passes on the i7 laptop;
 on the RTX 5050 the demo scan finishes within the `PLAN.md` target (~120 s) and all tests pass.
@@ -200,7 +207,13 @@ with a fake runner).
   phase N".
 - `scripts/build_demo_repo.py` that recreates `demo_repo`'s nested history (fix commit + decoys) so
   `learn --from-git` demos work from a clone (B25); document it in the README.
-- README rewrite: install, quick start, CPU vs GPU, commands, outputs, troubleshooting.
+- README rewrite: install, quick start, CPU vs GPU, commands, outputs, troubleshooting. The
+  troubleshooting section must cover the **Windows 260-character path limit** (installing into a
+  deep directory fails on a litellm data file unless long-path support is on or the venv path is
+  short), and the commands section must say that **`calibrate` and `seed` need explicit paths** when
+  run outside the checkout (`--fixtures-path`, the YAML path).
+- Point the README **CI badge at `main`** after the merge (it targets `production-hardening` now).
+- Optional: `mypy` on `omen/contracts.py`, `omen/tools.py`, `omen/store.py` (moved here from Phase 2).
 - Add `CHANGELOG.md`, `SECURITY.md` (threat model summary, how to report), `CONTRIBUTING.md`
   (test tiers, calibration rule, commit policy).
 - Update `docs/complete info about project.md`: fresh test counts, Appendix B status column,
@@ -224,6 +237,53 @@ Revisit only after Phase 8.
 | 2026-11-12 | 1 | `pytest -m "not live"`: **86 passed, 27 deselected** (113 total; 21 new tests). Live: `tests/test_tools.py` **39 passed** (incl. the live `search_memory`/`get_incident` test); `tests/test_runners.py -k tooled` **4 passed** in 1243.97 s on CPU (adk transcript 499 s, direct transcript 350 s, adk call cap 211 s, direct call cap 174 s). | Each of B1 B2 B3 B4 B5 B9 B10 B11 has a test that failed on the unfixed code (20 failed + 1 guard test passing) and passes after the fix. B3 also confirmed by hand: old `read_commit("--output=<path>")` wrote the file. Prompts, embeddings, `incidents.yaml`, `fixtures/` unchanged, so calibrate was not re-run. Schema: new `meta` table (`CREATE TABLE IF NOT EXISTS`, holds the ref high-water mark for B11); the real `omen_store/omen.db` got the empty table on first connect, 6 incidents intact. Two existing tests updated because they asserted the old behaviour (`test_budget_trips_wall_clock_ceiling`, B5; `test_budget_catches_tool_exceptions_and_caches_the_error`, B10). Appendix B of `docs/complete info about project.md` still to be marked "fixed in phase 1" for these IDs (Phase 8). New finding, not fixed: Scout drops files with non-ASCII names (git quotes them, e.g. `"caf\303\251.py"`), in every scope. |
 | 2026-11-12 | 0–1 | Summary of Phases 0 and 1 (commits `30b1345`, `791102e`): unit tier 65 → **86 passed**, 27 live deselected (92 → 113 tests). Live: `test_tools.py` **39 passed**; `test_runners.py -k tooled` **4 passed** (1243.97 s, CPU); `test_fixtures.py` 3 passed. `omen calibrate` unchanged (0.35: TP 4/4, HN 2/4, unrelated 0/4). | Fixed: B19 B20 (Phase 0); B1 B2 B3 B4 B5 (partial) B9 B10 B11 (Phase 1). Found: B29. Not run: full live suite, `test_triage.py`. |
 | 2026-11-12 | 2 | `pytest -m "not live"`: **126 passed, 25 deselected** (151 total; 38 new, 2 moved live → unit); same run with global/system git config hidden (as on CI): 126 passed. Coverage (unit tier) **87%**. `ruff check .`: clean. Live: `tests/test_tools.py` **39 passed**; extra check `test_runners.py -k matches_true_positive` **2 passed** (adk 270 s, direct 165 s, CPU) through the new host plumbing. `omen memory list`: 3.46 s → **1.42 s** (median of 3; ADK no longer imported). Fresh venv `pip install -e .` + run from another directory: `omen --help` 0, `memory list --store` 1 on empty / 0 after `seed`; wheel contains the 5 prompts and the console script. | Fixed: B16, B18, B24, B28, B29; cwd-relative prompts and store. Prompts moved with `git mv` to `omen/prompts/` (git blob ids, file sha256 and loaded-text sha256 identical before/after for all 5); empty unused `prompts/chronicler.txt` removed. **Prompt change (rule 3):** `read_file` tool docstring, `file_path` arg: "relative to the project root" → "relative to the postmortem's own folder" (factual fix after B4). No other prompt, embedding, `incidents.yaml` or fixture change, so calibrate not re-run. `--since` now includes untracked files. `test_demo_repo` Redis check rewritten in Python (no `grep` on Windows CI). CI not yet observed green at time of commit (see push notes). Found: on Windows without long-path support, installing into a deep directory fails on a litellm data file (path > 260 chars); not an Omen bug, document in Phase 8. |
+| 2026-11-12 | 2 (CI) | GitHub Actions run **43195240312** on `production-hardening` (commit `e56c8fd`): **green on both OSes**. ubuntu-latest and windows-latest, Python 3.11: `ruff check .` clean; **126 passed, 25 deselected**; coverage **87%** on both. | Recorded here because the Phase 2 row was written before CI had finished. |
+| 2026-11-12 | 3 | `pytest -m "not live"`: **183 passed, 26 deselected** (209 tests); coverage **91%**; `ruff check .` clean. Run against the Phase 2 code (a temporary worktree of `e56c8fd`), all 25 new or changed tests in the files that can run there failed, the 2 guard tests passed, and `test_evidence.py` (27 tests) and `test_adjudicator.py` fail at import (`omen.evidence`, `adjudicator_schema` do not exist there). Live (CPU): `tests/test_tools.py -m live` **1 passed**; `tests/test_adjudicator.py -m live` **4 passed** in 1282 s: end-to-end TP **confirmed** as OMEN-001 and kept by evidence validation (Investigator stopped on `wall_clock_cap` after 4 successful calls; cited lines 1-3 lie inside its `read_code` 1-50), end-to-end HN passed because Triage ruled NO_MATCH (Investigator/Adjudicator not reached), live structured Adjudicator chose **OMEN-001 over the first-listed OMEN-004 on both runners** (adk 174 s, direct 143 s); `tests/test_runners.py -k structured` **6 passed** in 1136 s (TP, HN, determinism, both runners). `omen calibrate`: unchanged (0.35: TP 4/4, HN 2/4, unrelated 0/4). | Fixed: **B6, B7, B12, B13, B14, B15, B17**; carry-overs **B30** (Sifter UTF-8 and `-z`), empty-ledger exit codes, CI actions v4/v5 → v7, plan edits. Appendix B of the reference doc has no status column, so it is not edited; the fixed IDs are listed here. **B6 decision:** chunk-line citations alone never confirm when the Investigator made no successful tool call (`evidence.validate_confirmed(..., allow_chunk_only=False)`, nothing sets it to True). Schema: version 2 via `meta.schema_version` (`tool_calls.note`, `runs.ms_scout`, `runs.ms_adjudicate`, `runs.n_written`, `findings.downgrade_reason`). Behaviour changes: `scan` on an empty ledger now exits 1 before embedding and records no run (before Phase 3 it exited 0 and recorded an empty run; `test_hardening` updated and moved to the unit tier); `memory list` on an empty ledger exits 0. Test infra: the conftest Ollama probe (1 s, once) marked a busy CPU Ollama unreachable and silently skipped the 6 runner tests on the first attempt; it now tries 3 times with a 5 s timeout, and the rerun above is the reported result. Observed: the live structured Adjudicator put `"grep_symbol({'symbol': 'cache_clear'}) -> []"` in `evidence_lines`; evidence validation would downgrade such a verdict (not a `path:line`). Prompt changes: see below. |
+
+### Phase 3 prompt changes (ground rule 3)
+
+On purpose, for B7 (Adjudicator and Investigator blindness to Triage). SHA-256 of the text as loaded
+(`omen.prompts.load_prompt`, LF line endings; equal to the git blob content):
+
+| prompt | before | after |
+|---|---|---|
+| `adjudicator.txt` | `ff58f856e09a947e7f1aa8a5d3962572bd0e5b355d5c4f871a6a58c47239df59` | `d30652c3ffc6de8d7a0582a4b4add54bf088552a5f73aae3d78eaa731d7240de` |
+| `investigator.txt` | `b6a6e220fd837f254d0820ed6f1044564014880be817aeef97e1bb3c92e0a982` | `9a55bc188a5d6c203e4310b5017b923514dc96fecda1df82be3b667b92a206ae` |
+| `triage.txt` (unchanged) | `3ccfe136ea5138671752a82fa69b07b353a90fb226ba16a0a4b976c6467ae9a6` | `3ccfe136ea5138671752a82fa69b07b353a90fb226ba16a0a4b976c6467ae9a6` |
+
+```diff
+--- a/omen/prompts/adjudicator.txt
++++ b/omen/prompts/adjudicator.txt
+@@ -1 +1 @@
+-You are the Adjudicator, the final judge in an institutional-memory system that catches code repeating a team's own past failures. Triage already ruled this chunk a plausible match, and the Investigator has since gathered evidence from the surrounding codebase. You do not see Triage's reasoning or its verdict — your ruling must rest only on the chunk itself, the candidate incident(s), and the investigation transcript in front of you.
++You are the Adjudicator, the final judge in an institutional-memory system that catches code repeating a team's own past failures. The Investigator has gathered evidence about this chunk from the surrounding codebase. Your ruling must rest only on the chunk itself, the candidate incident(s), and the investigation transcript in front of you.
+@@ -11 +11 @@ You are the Adjudicator, the final judge in an institutional-memory system that
+-State what the code can concretely do wrong, independent of the incident, before ruling — the same discipline as Triage, but now with the investigation's evidence in hand rather than the chunk alone.
++State what the code can concretely do wrong, independent of the incident, before ruling — with the investigation's evidence in hand rather than the chunk alone.
+--- a/omen/prompts/investigator.txt
++++ b/omen/prompts/investigator.txt
+@@ -1 +1 @@
+-You are the Investigator, the second stage in an institutional-memory system. Triage has already flagged this code chunk as a plausible match against one or more past incidents. Your job is not to re-decide MATCH or NO_MATCH — that belongs to the Adjudicator, who will read your transcript afterward without seeing Triage's reasoning. Your job is to gather the specific evidence that lets the Adjudicator decide correctly.
++You are the Investigator, the second stage in an institutional-memory system. This code chunk was retrieved as resembling one or more past incidents. Your job is not to decide MATCH or NO_MATCH — that belongs to the Adjudicator, who will read your transcript afterward. Your job is to gather the specific evidence that lets the Adjudicator decide correctly.
+@@ -12 +12 @@ You have four tools:
+-- `search_memory(query)` — semantic search over the incident ledger, in case the chunk resembles a different incident than the ones Triage surfaced.
++- `search_memory(query)` — semantic search over the incident ledger, in case the chunk resembles a different incident than the candidate incidents you were given.
+```
+
+Generated prompt text changed in the same phase:
+
+- **Investigator user prompt** (`cli._format_investigator_prompt`). Before:
+  `Triage ruled MATCH on this chunk against candidate incident(s) <refs>.` /
+  `Triage's stated mechanism: <Triage code_mechanism>` / the code chunk / `Investigate whether this chunk
+  actually shares the candidate incident's failure mechanism.` After: the code chunk, the
+  `CANDIDATE INCIDENTS:` block (ref, title, failure_mechanism, the_rule: the same block the Adjudicator
+  sees), then `Investigate whether this chunk actually shares a candidate incident's failure mechanism.`
+- **Adjudicator output schema** (B17): new required field `incident_ref` (enum of the call's candidate
+  refs) with the description "The ref of the candidate incident this verdict is about, exactly as listed
+  under CANDIDATE INCIDENTS." It is the last property, so the order of the existing fields is unchanged.
+
+Retrieval inputs (embeddings, prefixes, `incidents.yaml`, `fixtures/`, `triage.txt`) are unchanged;
+`omen calibrate` was re-run anyway and is identical. The Adjudicator live tests were re-run (row above).
 
 Phase 0 calibration sweep (`python -m omen.cli calibrate`, real `omen_store/`, 2026-11-12):
 

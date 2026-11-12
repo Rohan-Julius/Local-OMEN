@@ -400,6 +400,13 @@ class ToolBudget:
         self._start: float | None = None
         self._count = 0
         self._cache: dict[tuple, object] = {}
+        # What actually happened in this loop, in order: "call_cap",
+        # "wall_clock_cap" (a call refused by a cap) and "error" (a tool
+        # raised). runners derive stopped_reason from these (audit B13).
+        self.events: list[str] = []
+
+    def record_event(self, kind: str) -> None:
+        self.events.append(kind)
 
     def elapsed_seconds(self) -> float:
         """Seconds since the first tool call; 0.0 before any call."""
@@ -426,8 +433,10 @@ class ToolBudget:
         if self._start is None:
             self._start = time.monotonic()
         if self.elapsed_seconds() > self.wall_clock_seconds:
+            self.record_event("wall_clock_cap")
             return False, None, "wall-clock ceiling exceeded - stop calling tools and answer now"
         if self._count >= self.max_calls:
+            self.record_event("call_cap")
             return False, None, f"max {self.max_calls} tool calls exceeded - stop calling tools and answer now"
 
         key = self._key(tool_name, kwargs)
@@ -446,6 +455,8 @@ class ToolBudget:
             result, note = f"error: {e}", "error"
         except Exception as e:
             result, note = f"error: {type(e).__name__}: {e}", "error"
+        if note == "error":
+            self.record_event("error")
 
         self._cache[key] = result
         return True, result, note

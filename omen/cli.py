@@ -26,6 +26,7 @@ from pathlib import Path
 from omen import (
     archivist,
     config,
+    evidence,
     fixtures as fixtures_mod,
     librarian,
     prompts,
@@ -36,7 +37,16 @@ from omen import (
     tools as tools_mod,
     vectors,
 )
-from omen.contracts import AdjudicatorVerdict, Finding, GatedChunk, RetrievalCandidate, RunRecord, ToolCallRecord, Transcript, TriageVerdict
+from omen.contracts import (
+    Finding,
+    GatedChunk,
+    RetrievalCandidate,
+    RunRecord,
+    ToolCallRecord,
+    Transcript,
+    TriageVerdict,
+    adjudicator_schema,
+)
 
 # Windows consoles default to a legacy codepage that mangles em-dashes and
 # other non-ASCII content living in incident/postmortem text (renders as
@@ -87,8 +97,9 @@ def cmd_memory_list(args: argparse.Namespace) -> int | None:
     conn = store.connect()
     incidents = store.list_incidents(conn)
     if not incidents:
+        # Listing an empty ledger is a valid answer, not an error.
         print("No incidents in the ledger yet. Run `omen seed incidents.yaml`.")
-        return EXIT_USER_ERROR
+        return EXIT_OK
     for inc in incidents:
         print(f"{inc.ref}  [{inc.learned_by}]  {inc.title}  ({len(inc.surface_forms)} surface forms)")
 
@@ -102,10 +113,50 @@ def cmd_memory_forget(args: argparse.Namespace) -> int | None:
     print(f"Forgot {args.ref} (removed from ledger and vector index).")
 
 
-def _on_step_printer():
+def _start_run(conn, mission: str, repo_path: Path, scope: str, runner: str) -> str:
+    run_id = uuid.uuid4().hex[:12]
+    store.start_run(
+        conn,
+        RunRecord(
+            run_id=run_id,
+            mission=mission,
+            repo_path=str(repo_path),
+            scope=scope,
+            llm_model=config.LLM_MODEL,
+            embed_model=config.EMBED_MODEL,
+            runner=runner,
+        ),
+    )
+    return run_id
+
+
+def _step_recorder(conn, run_id: str, label: str, indent: str = "  ", on_record=None):
+    """The Scribe's per-tool-call path, shared by `scan` (label = chunk
+    symbol) and `learn` (label = the source being learned from, audit
+    B15): print the call, persist it to `tool_calls` with its note (cap,
+    duplicate or error, audit B12), then call `on_record`."""
+    seq = 0
+
     def on_step(step) -> None:
+        nonlocal seq
+        seq += 1
         note = f"  ({step.note})" if step.note else ""
-        print(f"  [tool] {step.tool_name}({step.args}) -> {str(step.result)[:100]!r}{note}")
+        print(f"{indent}[tool] {step.tool_name}({step.args}) -> {str(step.result)[:100]!r}{note}")
+        store.record_tool_call(
+            conn,
+            ToolCallRecord(
+                run_id=run_id,
+                chunk_symbol=label,
+                seq=seq,
+                tool_name=step.tool_name,
+                args_json=json.dumps(step.args),
+                result_summary=str(step.result)[:200],
+                ms=step.ms,
+                note=step.note,
+            ),
+        )
+        if on_record:
+            on_record(step)
 
     return on_step
 
@@ -132,28 +183,40 @@ async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> int |
     if confined is None:
         return EXIT_USER_ERROR
     root, rel_path = confined
-    print(f"[archivist] reading {args.postmortem_path}...")
-    transcript = await archivist.learn_from_postmortem(
-        runner,
-        conn,
-        root,
-        rel_path,
-        on_step=_on_step_printer(),
-        source=f"postmortem:{args.postmortem_path}",
-    )
-    print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
-    print(f"[archivist] summary: {transcript.final_text}")
+    source = f"postmortem:{args.postmortem_path}"
+    start = time.perf_counter()
+    run_id = _start_run(conn, "learn", root, source, args.runner)
+    fields = {"n_investigated": 0, "n_tool_calls": 0, "n_written": 0}
+    try:
+        print(f"[archivist] reading {args.postmortem_path}...")
+        transcript = await archivist.learn_from_postmortem(
+            runner,
+            conn,
+            root,
+            rel_path,
+            on_step=_step_recorder(conn, run_id, source),
+            source=source,
+        )
+        fields["n_investigated"] = 1
+        fields["n_tool_calls"] = len(transcript.steps)
+        print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+        print(f"[archivist] summary: {transcript.final_text}")
 
-    ref = archivist.written_ref(transcript)
-    if ref:
-        print(f"Learned/updated {ref}. Run `omen memory forget {ref}` to undo.")
-    else:
-        print("No incident was written.")
+        ref = archivist.written_ref(transcript)
+        if ref:
+            fields["n_written"] = 1
+            print(f"Learned/updated {ref}. Run `omen memory forget {ref}` to undo.")
+        else:
+            print("No incident was written.")
+    finally:
+        ms = round((time.perf_counter() - start) * 1000)
+        store.finish_run(conn, run_id, ms_investigate=ms, ms_total=ms, **fields)
 
 
 async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> int | None:
     # The repo being learned from is a plain argument (--repo, default the
     # cwd), exactly like `omen scan <path>`.
+    start = time.perf_counter()
     repo_root = Path(args.repo).resolve()
     candidates = sifter.select_candidates(repo_root, args.from_git, max_commits=args.max_commits)
     print(f"[sifter] {args.from_git}: {len(candidates)} candidate(s) out of up to {args.max_commits} commit(s) considered")
@@ -169,17 +232,35 @@ async def _cmd_learn_git(args: argparse.Namespace, conn, runner) -> int | None:
         print(f"--max-learn {args.max_learn}: only the first {len(to_learn)} candidate(s) will be learned")
 
     learned: list[str] = []
-    for c in to_learn:
-        print(f"\n[archivist] learning from {c.sha[:8]} ({c.reason}): {c.subject}")
-        transcript = await archivist.learn_from_commit(runner, conn, repo_root, c.sha, on_step=_on_step_printer())
-        print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
-        print(f"[archivist] summary: {transcript.final_text}")
-        ref = archivist.written_ref(transcript)
-        if ref:
-            print(f"  -> {ref}")
-            learned.append(ref)
-        else:
-            print("  -> no incident written")
+    run_id = _start_run(conn, "learn", repo_root, f"git:{args.from_git}", args.runner)
+    fields = {"n_investigated": 0, "n_tool_calls": 0, "n_written": 0}
+    archivist_watch = report.Stopwatch()
+    try:
+        for c in to_learn:
+            print(f"\n[archivist] learning from {c.sha[:8]} ({c.reason}): {c.subject}")
+            with archivist_watch.lap():
+                transcript = await archivist.learn_from_commit(
+                    runner, conn, repo_root, c.sha, on_step=_step_recorder(conn, run_id, f"git:{c.sha[:12]}")
+                )
+            fields["n_investigated"] += 1
+            fields["n_tool_calls"] += len(transcript.steps)
+            print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
+            print(f"[archivist] summary: {transcript.final_text}")
+            ref = archivist.written_ref(transcript)
+            if ref:
+                print(f"  -> {ref}")
+                learned.append(ref)
+            else:
+                print("  -> no incident written")
+    finally:
+        fields["n_written"] = len(learned)
+        store.finish_run(
+            conn,
+            run_id,
+            ms_investigate=archivist_watch.total_ms,
+            ms_total=round((time.perf_counter() - start) * 1000),
+            **fields,
+        )
 
     if learned:
         print(f"\nLearned/updated {len(learned)} incident(s): {', '.join(learned)}. Run `omen memory forget <ref>` to undo any of them.")
@@ -232,15 +313,20 @@ def _format_triage_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> 
     return "\n".join(lines)
 
 
-def _format_investigator_prompt(chunk, verdict: TriageVerdict, candidates: list[RetrievalCandidate]) -> str:
-    refs = ", ".join(c.incident_ref for c in candidates)
-    return (
-        f"Triage ruled MATCH on this chunk against candidate incident(s) {refs}.\n"
-        f"Triage's stated mechanism: {verdict.code_mechanism}\n\n"
-        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):\n"
-        f"{chunk.content}\n\n"
-        f"Investigate whether this chunk actually shares the candidate incident's failure mechanism."
-    )
+def _format_investigator_prompt(conn, chunk, candidates: list[RetrievalCandidate]) -> str:
+    """The chunk and the candidate incidents only. Triage's verdict and
+    mechanism used to be passed here; the Investigator's summary could
+    echo them into the Adjudicator's prompt, so the Adjudicator was not
+    blind to Triage (audit B7)."""
+    lines = [
+        f"CODE CHUNK ({chunk.file_path}:{chunk.symbol}, lines {chunk.start_line}-{chunk.end_line}):",
+        chunk.content,
+        "",
+    ]
+    lines += _format_candidate_block(conn, candidates)
+    lines.append("")
+    lines.append("Investigate whether this chunk actually shares a candidate incident's failure mechanism.")
+    return "\n".join(lines)
 
 
 def _format_adjudicator_prompt(conn, chunk, candidates: list[RetrievalCandidate], transcript: Transcript) -> str:
@@ -269,12 +355,16 @@ def _format_adjudicator_prompt(conn, chunk, candidates: list[RetrievalCandidate]
     return "\n".join(lines)
 
 
-def _finalize_adjudicator_verdict(verdict: AdjudicatorVerdict) -> AdjudicatorVerdict:
-    """PLAN.md Phase 7: "Empty evidence_lines on a positive -> auto-downgraded
-    in code" — never left to the model's discretion."""
-    if verdict.verdict == "confirmed" and not verdict.evidence_lines:
-        return verdict.model_copy(update={"verdict": "unverified"})
-    return verdict
+def _chosen_candidate(verdict, candidates: list[RetrievalCandidate]) -> RetrievalCandidate:
+    """The candidate the Adjudicator ruled on (audit B17). The per-call
+    schema restricts `incident_ref` to these refs, so the fallback to the
+    top candidate only fires for a runner that ignored the schema."""
+    for cand in candidates:
+        if cand.incident_ref == verdict.incident_ref:
+            return cand
+    log.warning("adjudicator returned incident_ref %r, not a candidate; recording against %s",
+                verdict.incident_ref, candidates[0].incident_ref)
+    return candidates[0]
 
 
 async def _triage_and_investigate(
@@ -292,6 +382,7 @@ async def _triage_and_investigate(
 
     triage_watch = report.Stopwatch()
     investigate_watch = report.Stopwatch()
+    adjudicate_watch = report.Stopwatch()
     findings: list[Finding] = []
 
     for gc in gated:
@@ -314,28 +405,12 @@ async def _triage_and_investigate(
         print("  [investigator] investigating...")
         scan_tools = tools_mod.build_scan_tools(repo_path, conn)
         budget = tools_mod.ToolBudget()
-        investigator_prompt = _format_investigator_prompt(c, verdict, gc.candidates)
+        investigator_prompt = _format_investigator_prompt(conn, c, gc.candidates)
 
-        seq = 0
-
-        def on_step(step) -> None:
-            nonlocal seq
-            seq += 1
-            note = f"  ({step.note})" if step.note else ""
-            print(f"    [tool] {step.tool_name}({step.args}) -> {step.result[:100]!r}{note}")
-            store.record_tool_call(
-                conn,
-                ToolCallRecord(
-                    run_id=run_id,
-                    chunk_symbol=c.symbol,
-                    seq=seq,
-                    tool_name=step.tool_name,
-                    args_json=json.dumps(step.args),
-                    result_summary=step.result[:200],
-                    ms=step.ms,
-                ),
-            )
+        def count_call(step) -> None:
             stats.n_tool_calls += 1
+
+        on_step = _step_recorder(conn, run_id, c.symbol, indent="    ", on_record=count_call)
 
         with investigate_watch.lap():
             transcript = await runner.run_tooled(
@@ -352,14 +427,15 @@ async def _triage_and_investigate(
 
         print("  [adjudicator] adjudicating...")
         adjudicator_prompt = _format_adjudicator_prompt(conn, c, gc.candidates, transcript)
-        raw_adj_verdict = await runner.run_structured(
-            adjudicator_instruction, adjudicator_prompt, AdjudicatorVerdict, think=config.THINK_DEFAULT
-        )
-        adj_verdict = _finalize_adjudicator_verdict(raw_adj_verdict)
-        downgrade_note = (
-            "  (downgraded: confirmed with no evidence_lines)" if adj_verdict.verdict != raw_adj_verdict.verdict else ""
-        )
+        schema = adjudicator_schema([cand.incident_ref for cand in gc.candidates])
+        with adjudicate_watch.lap():
+            raw_adj_verdict = await runner.run_structured(
+                adjudicator_instruction, adjudicator_prompt, schema, think=config.THINK_DEFAULT
+            )
+        adj_verdict, downgrade_reason = evidence.validate_confirmed(raw_adj_verdict, c, transcript, repo_path)
+        downgrade_note = f"  (downgraded from confirmed: {downgrade_reason})" if downgrade_reason else ""
         print(f"  [adjudicator] verdict={adj_verdict.verdict}{downgrade_note}  confidence={adj_verdict.confidence}")
+        print(f"  [adjudicator] incident: {adj_verdict.incident_ref}")
         print(f"  [adjudicator] mechanism: {adj_verdict.code_mechanism}")
         print(f"  [adjudicator] reasoning: {adj_verdict.reasoning}")
         for line in adj_verdict.evidence_lines:
@@ -368,41 +444,45 @@ async def _triage_and_investigate(
         if adj_verdict.verdict == "confirmed":
             stats.n_confirmed += 1
 
-        # AdjudicatorVerdict carries no structured incident_ref of its own
-        # (it rules on the chunk, not on a specific candidate id) — the
-        # candidate list is already similarity-sorted descending
-        # (librarian.collapse_to_incidents), so the top one is the incident
-        # this finding is recorded against.
-        top_candidate = gc.candidates[0]
+        chosen = _chosen_candidate(adj_verdict, gc.candidates)
         finding = Finding(
             run_id=run_id,
-            incident_ref=top_candidate.incident_ref,
+            incident_ref=chosen.incident_ref,
             file_path=c.file_path,
             start_line=c.start_line,
             end_line=c.end_line,
             symbol=c.symbol,
-            similarity=top_candidate.similarity,
+            similarity=chosen.similarity,
             verdict=adj_verdict.verdict,
             code_mechanism=adj_verdict.code_mechanism,
             reasoning=adj_verdict.reasoning,
             evidence="; ".join(adj_verdict.evidence_lines),
             confidence=adj_verdict.confidence,
             tool_calls=len(transcript.steps),
+            downgrade_reason=downgrade_reason,
         )
         store.record_finding(conn, finding)
         findings.append(finding)
 
     stats.ms_triage = triage_watch.total_ms
     stats.ms_investigate = investigate_watch.total_ms
+    stats.ms_adjudicate = adjudicate_watch.total_ms
     return findings
 
 
 async def cmd_scan(args: argparse.Namespace) -> int | None:
     if not Path(args.path).is_dir():
         return _user_error(f"{args.path} is not a directory")
+    if not args.dry_run and not store.list_incidents(store.connect()):
+        # Nothing to match against: a scan cannot find anything, so say so
+        # instead of embedding the code and recording an empty run.
+        return _user_error("the incident ledger is empty - run `omen seed <incidents.yaml>` and `omen reindex` first")
+    total_start = time.perf_counter()
     repo_path = Path(args.path).resolve()
-    scope_result = scout.resolve_scope(repo_path, since=args.since, all_files=args.all)
-    chunks = scout.chunk_files(scope_result.files, repo_root=repo_path)
+    scout_watch = report.Stopwatch()
+    with scout_watch.lap():
+        scope_result = scout.resolve_scope(repo_path, since=args.since, all_files=args.all)
+        chunks = scout.chunk_files(scope_result.files, repo_root=repo_path)
     print(f"scope: {scope_result.scope}  ({len(scope_result.files)} file(s), {len(chunks)} chunk(s))")
     if not chunks:
         return
@@ -431,25 +511,13 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
 
     # --dry-run and --retrieval-only never reach here, so neither shows up
     # in `runs` — both are explicitly no-generation previews, not scans.
-    run_id = uuid.uuid4().hex[:12]
-    store.start_run(
-        conn,
-        RunRecord(
-            run_id=run_id,
-            mission="scan",
-            repo_path=str(repo_path),
-            scope=scope_result.scope,
-            llm_model=config.LLM_MODEL,
-            embed_model=config.EMBED_MODEL,
-            runner=args.runner,
-        ),
-    )
-    total_start = time.perf_counter()
+    run_id = _start_run(conn, "scan", repo_path, scope_result.scope, args.runner)
     stats = report.ScanStats(
         n_files=len(scope_result.files),
         n_chunks=len(chunks),
         n_cache_hits=embed_stats.n_cache_hits,
         n_gated=len(gated),
+        ms_scout=scout_watch.total_ms,
         ms_embed=embed_watch.total_ms,
     )
 
@@ -457,6 +525,7 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
     if gated:
         findings = await _triage_and_investigate(args, conn, repo_path, gated, run_id, stats)
 
+    # From the start of the command: Scout and embedding included (audit B14).
     stats.ms_total = round((time.perf_counter() - total_start) * 1000)
     store.finish_run(conn, run_id, **stats.as_run_fields())
     report.print_summary(stats, findings)

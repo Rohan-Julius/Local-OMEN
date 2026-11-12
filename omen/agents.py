@@ -77,9 +77,11 @@ async def run_tooled_adk(
     max_llm_calls: int,
     think: bool = True,
     on_text: Callable[[str], None] | None = None,
-) -> str:
+) -> tuple[str, bool]:
     """Drives the ADK agent loop to completion and returns its final
-    free-text answer. Tool-call bookkeeping (caps/dedup/transcript) is
+    free-text answer, and whether ADK's own `max_llm_calls` safety net cut
+    the loop (so the caller can report a call cap, audit B13).
+ Tool-call bookkeeping (caps/dedup/transcript) is
     already baked into `tools` by tools.budgeted_tools() before this is
     called — this function only drives ADK's side of the loop.
 
@@ -104,6 +106,7 @@ async def run_tooled_adk(
     run_config = RunConfig(streaming_mode=StreamingMode.NONE, max_llm_calls=max_llm_calls)
 
     final_text_parts: list[str] = []
+    hit_llm_call_limit = False
     try:
         async for event in runner.run_async(
             user_id=_APP_NAME, session_id=session.id, new_message=content, run_config=run_config
@@ -122,6 +125,6 @@ async def run_tooled_adk(
                     if not getattr(part, "thought", False):
                         final_text_parts.append(text)
     except LlmCallsLimitExceededError:
-        pass  # the outer safety net fired; caller infers stopped_reason from the (likely empty) result
+        hit_llm_call_limit = True  # the outer safety net fired
 
-    return "".join(final_text_parts).strip()
+    return "".join(final_text_parts).strip(), hit_llm_call_limit

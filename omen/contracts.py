@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # ---------------------------------------------------------------------------
 # Memory: incidents.yaml, SQLite `incidents` + `surface_forms`
@@ -116,7 +116,7 @@ class Transcript(BaseModel):
 
     steps: list[ToolCallStep] = Field(default_factory=list)
     final_text: str = ""
-    stopped_reason: Literal["model_finished", "call_cap", "wall_clock_cap"] = "model_finished"
+    stopped_reason: Literal["model_finished", "call_cap", "wall_clock_cap", "error"] = "model_finished"
 
 
 class AdjudicatorVerdict(BaseModel):
@@ -125,6 +125,31 @@ class AdjudicatorVerdict(BaseModel):
     reasoning: str
     evidence_lines: list[str] = Field(default_factory=list)
     confidence: Literal["low", "medium", "high"]
+    # Optional here; required and restricted to the call's candidate refs in
+    # the per-call schema from `adjudicator_schema` (audit B17).
+    incident_ref: str | None = None
+
+
+INCIDENT_REF_DESCRIPTION = "The ref of the candidate incident this verdict is about, exactly as listed under CANDIDATE INCIDENTS."
+
+
+def adjudicator_schema(candidate_refs: list[str]) -> type[AdjudicatorVerdict]:
+    """The Adjudicator's output schema for one call: `AdjudicatorVerdict`
+    with `incident_ref` required and limited to this chunk's candidate refs
+    (a JSON-schema enum), so the finding is recorded against the incident
+    the Adjudicator actually ruled on rather than the top retrieval
+    candidate (audit B17). Works for both runners: ADK's `output_schema`
+    and Ollama's `format=` both take the model's JSON schema."""
+    refs = tuple(dict.fromkeys(candidate_refs))  # de-duplicated, order kept
+    if not refs:
+        raise ValueError("adjudicator_schema needs at least one candidate ref")
+    return create_model(
+        "AdjudicatorVerdict",
+        __base__=AdjudicatorVerdict,
+        # json_schema_extra: a single ref would otherwise be emitted as "const",
+        # which not every structured-output path supports; always give "enum".
+        incident_ref=(Literal[refs], Field(description=INCIDENT_REF_DESCRIPTION, json_schema_extra={"enum": list(refs)})),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +172,9 @@ class Finding(BaseModel):
     evidence: str | None = None
     confidence: str | None = None
     tool_calls: int | None = None
+    # Why a `confirmed` verdict was downgraded to `unverified` by evidence
+    # validation (omen/evidence.py, audit B6); None if it was not.
+    downgrade_reason: str | None = None
 
 
 class RunRecord(BaseModel):
@@ -167,9 +195,12 @@ class RunRecord(BaseModel):
     n_investigated: int | None = None
     n_tool_calls: int | None = None
     n_confirmed: int | None = None
+    n_written: int | None = None  # learn: incidents written or updated
+    ms_scout: int | None = None
     ms_embed: int | None = None
     ms_triage: int | None = None
     ms_investigate: int | None = None
+    ms_adjudicate: int | None = None
     ms_total: int | None = None
 
 
@@ -182,3 +213,4 @@ class ToolCallRecord(BaseModel):
     args_json: str | None = None
     result_summary: str | None = None
     ms: int | None = None
+    note: str | None = None  # cap, duplicate or error notice (audit B12)

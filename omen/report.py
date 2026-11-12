@@ -51,10 +51,12 @@ class ScanStats:
     n_investigated: int = 0
     n_tool_calls: int = 0
     n_confirmed: int = 0
+    ms_scout: int = 0
     ms_embed: int = 0
     ms_triage: int = 0
     ms_investigate: int = 0
-    ms_total: int = 0
+    ms_adjudicate: int = 0
+    ms_total: int = 0  # wall clock for the whole command, Scout included (audit B14)
 
     def as_run_fields(self) -> dict:
         return {
@@ -66,9 +68,11 @@ class ScanStats:
             "n_investigated": self.n_investigated,
             "n_tool_calls": self.n_tool_calls,
             "n_confirmed": self.n_confirmed,
+            "ms_scout": self.ms_scout,
             "ms_embed": self.ms_embed,
             "ms_triage": self.ms_triage,
             "ms_investigate": self.ms_investigate,
+            "ms_adjudicate": self.ms_adjudicate,
             "ms_total": self.ms_total,
         }
 
@@ -81,8 +85,9 @@ def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
         f"{stats.n_tool_calls} tool call(s)"
     )
     print(
-        f"  embed {stats.ms_embed / 1000:.1f}s  triage {stats.ms_triage / 1000:.1f}s  "
-        f"investigate {stats.ms_investigate / 1000:.1f}s"
+        f"  scout {stats.ms_scout / 1000:.1f}s  embed {stats.ms_embed / 1000:.1f}s  "
+        f"triage {stats.ms_triage / 1000:.1f}s  investigate {stats.ms_investigate / 1000:.1f}s  "
+        f"adjudicate {stats.ms_adjudicate / 1000:.1f}s"
     )
 
     if not findings:
@@ -95,3 +100,5 @@ def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
         print(f"  mechanism: {f.code_mechanism}")
         if f.evidence:
             print(f"  evidence: {f.evidence}")
+        if f.downgrade_reason:
+            print(f"  downgraded from confirmed: {f.downgrade_reason}")

@@ -55,7 +55,6 @@ async def test_store_flag_works_before_the_subcommand(tmp_path, capsys):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["memory", "list"],  # empty ledger
         ["memory", "forget", "OMEN-999"],  # unknown ref
         ["seed", "no-such-file.yaml"],
         ["scan", "no-such-dir"],
@@ -63,10 +62,40 @@ async def test_store_flag_works_before_the_subcommand(tmp_path, capsys):
         ["learn", "no-such-postmortem.md"],
         ["calibrate", "--fixtures-path", "no-such-fixtures.yaml"],
     ],
-    ids=["empty-ledger", "unknown-ref", "missing-yaml", "missing-scan-path", "no-learn-source", "missing-postmortem", "missing-fixtures"],
+    ids=["unknown-ref", "missing-yaml", "missing-scan-path", "no-learn-source", "missing-postmortem", "missing-fixtures"],
 )
 async def test_user_errors_exit_one(tmp_path, argv):
     assert await run(*argv, "--store", str(tmp_path / "store")) == cli.EXIT_USER_ERROR
+
+
+@pytest.mark.asyncio
+async def test_memory_list_on_empty_ledger_exits_zero(tmp_path, capsys):
+    """Listing an empty ledger is a valid answer, not an error."""
+    assert await run("memory", "list", "--store", str(tmp_path / "store")) == cli.EXIT_OK
+    assert "No incidents in the ledger yet" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_scan_on_empty_ledger_exits_one_without_embedding(tmp_path, monkeypatch, capsys):
+    """A scan against an empty ledger cannot find anything: exit 1 with a
+    clear message, before any embedding call and without recording a run."""
+    from omen import store, vectors
+
+    def no_embedding(prompts):
+        raise AssertionError("scan embedded code against an empty ledger")
+
+    monkeypatch.setattr(vectors, "_embed", no_embedding)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def f():\n    return 1\n")
+    store_dir = tmp_path / "store"
+
+    assert await run("scan", str(repo), "--all", "--store", str(store_dir)) == cli.EXIT_USER_ERROR
+    assert "ledger is empty" in capsys.readouterr().out
+    assert store.connect(store_dir / "omen.db").execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+    # --dry-run is Scout only and needs no ledger
+    assert await run("scan", str(repo), "--dry-run", "--store", str(store_dir)) == cli.EXIT_OK
 
 
 @pytest.mark.asyncio
@@ -101,7 +130,7 @@ async def test_runtime_error_traceback_only_with_verbose(tmp_path, monkeypatch, 
 
 
 def test_entrypoint_exits_with_mains_code(tmp_path, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["omen", "memory", "list", "--store", str(tmp_path / "empty")])
+    monkeypatch.setattr(sys, "argv", ["omen", "memory", "forget", "OMEN-999", "--store", str(tmp_path / "empty")])
     with pytest.raises(SystemExit) as exc:
         cli.entrypoint()
     assert exc.value.code == cli.EXIT_USER_ERROR

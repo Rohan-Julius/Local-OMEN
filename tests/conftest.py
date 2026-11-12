@@ -26,14 +26,21 @@ INCIDENTS_YAML = PROJECT_ROOT / "incidents.yaml"
 _ollama_reachable_cache: bool | None = None
 
 
-def ollama_reachable() -> bool:
+def ollama_reachable(attempts: int = 3, timeout: float = 5.0) -> bool:
+    """A CPU-bound Ollama that is still finishing a long generation can take
+    more than a second to answer even its root URL. A 1-second probe once
+    marked a running Ollama "unreachable" and silently skipped six live
+    tests (Phase 3), so probe patiently and more than once."""
     global _ollama_reachable_cache
     if _ollama_reachable_cache is None:
-        try:
-            urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-            _ollama_reachable_cache = True
-        except Exception:
-            _ollama_reachable_cache = False
+        _ollama_reachable_cache = False
+        for _ in range(attempts):
+            try:
+                urllib.request.urlopen(config.OLLAMA_HOST, timeout=timeout)
+                _ollama_reachable_cache = True
+                break
+            except Exception:
+                continue
     return _ollama_reachable_cache
 
 

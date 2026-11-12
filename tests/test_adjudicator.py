@@ -1,21 +1,24 @@
-"""Phase 7 acceptance (PLAN.md):
+"""Phase 7 acceptance (PLAN.md), extended in production-plan Phase 3:
 - "Assert the assembled prompt contains neither Triage's `reasoning` nor
   its verdict — a string assertion, because a leak looks like success
-  from the outside." (test_adjudicator_prompt_is_blind_to_triage)
-- "Empty evidence_lines on a positive -> auto-downgraded in code."
-  (test_confirmed_with_no_evidence_is_downgraded, no model needed)
-- "fixture precision improves or holds vs phase 6" — Phase 6 was 4/4 true
-  positives caught / 0/4 hard negatives flagged by Triage alone; Phase 7
-  runs the same true-positive/hard-negative pair all the way through
-  Investigator -> Adjudicator and checks the final verdict still holds.
+  from the outside." Since Phase 3 (audit B7) this covers the system
+  instructions of both the Adjudicator and the Investigator, and the
+  Investigator's prompt, not only the Adjudicator's prompt.
+- Evidence validation (audit B6) is tested in tests/test_evidence.py; it
+  replaced the old "non-empty evidence_lines" rule.
+- The per-call Adjudicator schema (audit B17): `incident_ref` is limited to
+  the chunk's candidate refs.
+- "fixture precision improves or holds vs phase 6": the same true-positive/
+  hard-negative pair all the way through Investigator -> Adjudicator.
 
-Live Ollama required for the end-to-end test (skips gracefully without
-it); the prompt-independence and downgrade tests are pure and always run.
+Live Ollama required for the end-to-end and live structured tests (they
+skip without it); everything else is pure and always runs.
 """
 
+import pydantic
 import pytest
 
-from omen import agents, cli, runners, store, tools
+from omen import cli, evidence, prompts, runners, store, tools
 from omen.contracts import (
     AdjudicatorVerdict,
     Chunk,
@@ -24,29 +27,68 @@ from omen.contracts import (
     ToolCallStep,
     Transcript,
     TriageVerdict,
+    adjudicator_schema,
 )
 
 
-def test_confirmed_with_no_evidence_is_downgraded():
-    v = AdjudicatorVerdict(
-        verdict="confirmed", code_mechanism="x", reasoning="y", evidence_lines=[], confidence="high"
+# ---------------------------------------------------------------------------
+# B17: the per-call schema
+# ---------------------------------------------------------------------------
+
+
+def test_adjudicator_schema_limits_incident_ref_to_the_candidates():
+    schema = adjudicator_schema(["OMEN-001", "OMEN-004", "OMEN-001"])
+    base = {"verdict": "rejected", "code_mechanism": "m", "reasoning": "r", "confidence": "low"}
+
+    assert schema.model_validate({**base, "incident_ref": "OMEN-004"}).incident_ref == "OMEN-004"
+    with pytest.raises(pydantic.ValidationError):
+        schema.model_validate({**base, "incident_ref": "OMEN-002"})  # not a candidate
+    with pytest.raises(pydantic.ValidationError):
+        schema.model_validate(base)  # required in the per-call schema
+    assert issubclass(schema, AdjudicatorVerdict)
+
+
+@pytest.mark.parametrize("refs", [["OMEN-001"], ["OMEN-001", "OMEN-004"]])
+def test_adjudicator_schema_json_has_an_enum_for_both_runners(refs):
+    """Both runners pass this JSON schema to the model (ADK output_schema,
+    Ollama format=). A single ref must still be an enum, not only const."""
+    js = adjudicator_schema(refs).model_json_schema()
+    assert js["properties"]["incident_ref"]["enum"] == refs
+    assert "incident_ref" in js["required"]
+    assert list(js["properties"])[:5] == ["verdict", "code_mechanism", "reasoning", "evidence_lines", "confidence"]
+
+
+def test_adjudicator_schema_needs_a_candidate():
+    with pytest.raises(ValueError):
+        adjudicator_schema([])
+
+
+# ---------------------------------------------------------------------------
+# B7: blindness to Triage
+# ---------------------------------------------------------------------------
+
+
+def test_role_instructions_do_not_mention_triage():
+    """The Adjudicator's instruction used to say "Triage already ruled this
+    chunk a plausible match"; the Investigator's said Triage "flagged" it."""
+    for name in ("adjudicator.txt", "investigator.txt"):
+        assert "triage" not in prompts.load_prompt(name).lower(), name
+
+
+def test_investigator_prompt_is_built_without_triage(tmp_path):
+    conn = store.connect(tmp_path / "test.db")
+    store.upsert_incident(
+        conn,
+        IncidentSeed(ref="OMEN-TEST", title="Test incident", failure_mechanism="things break", what_happened="x", the_rule="y"),
     )
-    assert cli._finalize_adjudicator_verdict(v).verdict == "unverified"
+    chunk = Chunk(file_path="app.py", start_line=1, end_line=1, symbol="f", content="def f(): pass", content_hash="abc")
+    candidates = [RetrievalCandidate(incident_ref="OMEN-TEST", similarity=0.9, matched_variant="mechanism")]
 
+    prompt = cli._format_investigator_prompt(conn, chunk, candidates)
 
-def test_confirmed_with_evidence_is_not_downgraded():
-    v = AdjudicatorVerdict(
-        verdict="confirmed", code_mechanism="x", reasoning="y", evidence_lines=["app.py:3"], confidence="high"
-    )
-    assert cli._finalize_adjudicator_verdict(v).verdict == "confirmed"
-
-
-def test_rejected_and_unverified_pass_through_unchanged():
-    for verdict in ("rejected", "unverified"):
-        v = AdjudicatorVerdict(
-            verdict=verdict, code_mechanism="x", reasoning="y", evidence_lines=[], confidence="low"
-        )
-        assert cli._finalize_adjudicator_verdict(v).verdict == verdict
+    assert "Triage" not in prompt and "MATCH" not in prompt
+    assert "def f(): pass" in prompt
+    assert "OMEN-TEST: Test incident" in prompt and "things break" in prompt
 
 
 def test_adjudicator_prompt_is_blind_to_triage(tmp_path):
@@ -146,9 +188,9 @@ async def test_adjudicator_end_to_end(tmp_path, code, symbol, should_confirm):
     candidates = [RetrievalCandidate(incident_ref="OMEN-001", similarity=0.9, matched_variant="mechanism")]
 
     runner = runners.ADKRoleRunner()
-    triage_instruction = agents.load_prompt("triage.txt")
-    investigator_instruction = agents.load_prompt("investigator.txt")
-    adjudicator_instruction = agents.load_prompt("adjudicator.txt")
+    triage_instruction = prompts.load_prompt("triage.txt")
+    investigator_instruction = prompts.load_prompt("investigator.txt")
+    adjudicator_instruction = prompts.load_prompt("adjudicator.txt")
 
     triage_prompt = cli._format_triage_prompt(conn, chunk, candidates)
     triage_verdict = await runner.run_structured(triage_instruction, triage_prompt, TriageVerdict, think=False)
@@ -162,21 +204,78 @@ async def test_adjudicator_end_to_end(tmp_path, code, symbol, should_confirm):
 
     scan_tools = tools.build_scan_tools(repo, conn)
     budget = tools.ToolBudget()
-    investigator_prompt = cli._format_investigator_prompt(chunk, triage_verdict, candidates)
+    investigator_prompt = cli._format_investigator_prompt(conn, chunk, candidates)
     transcript = await runner.run_tooled(
         investigator_instruction, investigator_prompt, scan_tools, budget, think=False
     )
+    print(f"\ninvestigator: stopped_reason={transcript.stopped_reason}")
+    for step in transcript.steps:
+        print(f"  [tool] {step.tool_name}({step.args}) note={step.note!r} -> {step.result[:80]!r}")
 
     adjudicator_prompt = cli._format_adjudicator_prompt(conn, chunk, candidates, transcript)
     raw_verdict = await runner.run_structured(
-        adjudicator_instruction, adjudicator_prompt, AdjudicatorVerdict, think=False
+        adjudicator_instruction, adjudicator_prompt, adjudicator_schema(["OMEN-001"]), think=False
     )
-    verdict = cli._finalize_adjudicator_verdict(raw_verdict)
+    verdict, downgrade_reason = evidence.validate_confirmed(raw_verdict, chunk, transcript, repo)
+    print(f"adjudicator: raw={raw_verdict.verdict} final={verdict.verdict} ref={verdict.incident_ref} "
+          f"evidence={verdict.evidence_lines} downgrade={downgrade_reason!r}")
+    assert verdict.incident_ref == "OMEN-001"
 
     if should_confirm:
         assert verdict.verdict == "confirmed", (
-            f"expected confirmed, got {verdict.verdict}: {verdict.reasoning}"
+            f"expected confirmed, got {verdict.verdict} (downgrade: {downgrade_reason}): {verdict.reasoning}"
         )
         assert verdict.evidence_lines, "confirmed verdict must carry evidence_lines (or be auto-downgraded)"
     else:
         assert verdict.verdict != "confirmed", f"hard negative was confirmed: {verdict.reasoning}"
+
+
+# ---------------------------------------------------------------------------
+# B17 live: one structured Adjudicator call per runner
+# ---------------------------------------------------------------------------
+
+LIVE_ADJUDICATOR_PROMPT = """CODE CHUNK (permissions.py:has_access, lines 3-5):
+@functools.lru_cache(maxsize=1024)
+def has_access(user_id, resource_id):
+    return _compute_permission(user_id, resource_id)
+
+CANDIDATE INCIDENTS:
+OMEN-004: Check-then-act race condition without atomicity
+  failure_mechanism: A value is checked and then acted on in two separate steps with no lock or atomic operation between them, so a concurrent change lands in the gap.
+  the_rule: Any check-then-act sequence on shared state must be atomic.
+OMEN-001: Stale permission cache after revocation
+  failure_mechanism: An authorization decision is cached with no invalidation path tied to the permission-changing event, so a revoked permission keeps succeeding.
+  the_rule: Any cache keyed on an authorization decision must be invalidated explicitly by the event that changes the permission.
+
+INVESTIGATION TRANSCRIPT:
+  [1] read_code({'file_path': 'permissions.py', 'start_line': 1, 'end_line': 12}) -> import functools
+
+@functools.lru_cache(maxsize=1024)
+def has_access(user_id, resource_id):
+    return _compute_permission(user_id, resource_id)
+
+
+def revoke(user_id, resource_id):
+    _store.delete(user_id, resource_id)
+  [2] grep_symbol({'symbol': 'cache_clear'}) -> []
+
+INVESTIGATOR'S SUMMARY:
+has_access caches the permission decision with functools.lru_cache (permissions.py:3-5). revoke (permissions.py:8-9) deletes the stored permission but never calls has_access.cache_clear(); grep_symbol found no cache_clear call anywhere.
+"""
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_cls", [runners.ADKRoleRunner, runners.DirectOllamaRunner], ids=["adk", "direct"])
+async def test_live_structured_adjudicator_returns_a_candidate_ref(runner_cls):
+    """The candidates are listed with the less relevant one (OMEN-004)
+    first, so recording against candidates[0] would be wrong."""
+    schema = adjudicator_schema(["OMEN-004", "OMEN-001"])
+    verdict = await runner_cls().run_structured(
+        prompts.load_prompt("adjudicator.txt"), LIVE_ADJUDICATOR_PROMPT, schema, think=False
+    )
+    print(f"\n{runner_cls.__name__}: verdict={verdict.verdict} incident_ref={verdict.incident_ref} "
+          f"confidence={verdict.confidence} evidence={verdict.evidence_lines}")
+    assert isinstance(verdict, schema)
+    assert verdict.incident_ref in ("OMEN-004", "OMEN-001")
+    assert verdict.incident_ref == "OMEN-001", f"chose {verdict.incident_ref}: {verdict.reasoning}"

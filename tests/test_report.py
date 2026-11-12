@@ -35,14 +35,18 @@ def test_stopwatch_accumulates_across_laps():
     assert watch.total_ms >= 15  # two ~10ms laps, generous floor for CI jitter
 
 
-def test_scan_stats_as_run_fields_matches_runs_columns():
+def test_scan_stats_as_run_fields_matches_runs_columns(tmp_path):
     stats = report.ScanStats(n_files=2, n_chunks=5, n_gated=1, ms_embed=100)
     fields = stats.as_run_fields()
     expected_keys = {
         "n_files", "n_chunks", "n_cache_hits", "n_gated", "n_triaged", "n_investigated",
-        "n_tool_calls", "n_confirmed", "ms_embed", "ms_triage", "ms_investigate", "ms_total",
+        "n_tool_calls", "n_confirmed", "ms_scout", "ms_embed", "ms_triage", "ms_investigate",
+        "ms_adjudicate", "ms_total",
     }
     assert set(fields) == expected_keys
+    # every field is a real `runs` column (after migrations), so finish_run cannot fail on it
+    columns = {r["name"] for r in store.connect(tmp_path / "t.db").execute("PRAGMA table_info(runs)")}
+    assert set(fields) <= columns
     assert fields["n_chunks"] == 5
     assert fields["ms_embed"] == 100
 
@@ -95,13 +99,14 @@ class _FakeRunner:
                 confidence="high",
                 reasoning="matches OMEN-001's stale-permission-cache mechanism",
             )
-        if schema is AdjudicatorVerdict:
-            return AdjudicatorVerdict(
+        if issubclass(schema, AdjudicatorVerdict):  # the per-call schema (B17)
+            return schema(
                 verdict="confirmed",
                 code_mechanism="caches a permission decision with no invalidation",
                 reasoning="matches OMEN-001",
                 evidence_lines=["permissions.py:3: no cache_clear call found anywhere in the file"],
                 confidence="high",
+                incident_ref="OMEN-001",
             )
         raise AssertionError(f"unexpected schema {schema}")
 

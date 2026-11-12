@@ -83,6 +83,59 @@ CREATE TABLE IF NOT EXISTS meta (
 # a forgotten ref is never handed out again (audit B11).
 REF_HIGH_WATER_KEY = "ref_high_water"
 
+# Schema versioning. SCHEMA above is version 1, the layout every database
+# had before Phase 3 (with or without the `meta` table). Each migration
+# moves a database from version n-1 to n and is applied once, in order,
+# inside a transaction; `meta.schema_version` records the result. A fresh
+# database is created at version 1 by SCHEMA and migrated forward the same
+# way, so there is one path for old and new databases. Phase 4 extends
+# this list; never edit an applied migration, add a new one.
+SCHEMA_VERSION_KEY = "schema_version"
+MIGRATIONS: list[tuple[int, list[str]]] = [
+    (
+        2,  # Phase 3: audit trail (B12, B14, B15) and evidence downgrade reason (B6)
+        [
+            "ALTER TABLE tool_calls ADD COLUMN note TEXT",
+            "ALTER TABLE runs ADD COLUMN ms_scout INTEGER",
+            "ALTER TABLE runs ADD COLUMN ms_adjudicate INTEGER",
+            "ALTER TABLE runs ADD COLUMN n_written INTEGER",
+            "ALTER TABLE findings ADD COLUMN downgrade_reason TEXT",
+        ],
+    ),
+]
+SCHEMA_VERSION = MIGRATIONS[-1][0]
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)).fetchone()
+    return int(row["value"]) if row else 1
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Bring the database up to SCHEMA_VERSION. Returns the version it
+    started at. Rows are never touched, only columns added."""
+    start = current = schema_version(conn)
+    for version, statements in MIGRATIONS:
+        if version <= current:
+            continue
+        # One explicit transaction per migration: all of it or none of it.
+        # (Python 3.11's sqlite3 does not open a transaction before DDL on
+        # its own, so `with conn:` alone would let each ALTER autocommit.)
+        conn.execute("BEGIN")
+        try:
+            for statement in statements:
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (SCHEMA_VERSION_KEY, str(version)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        current = version
+    return start
+
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
     """Open (creating if needed) the ledger. Default: `config.DB_PATH`,
@@ -93,6 +146,7 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 
@@ -275,14 +329,14 @@ def record_finding(conn: sqlite3.Connection, finding) -> int:
         """INSERT INTO findings
            (run_id, incident_ref, file_path, start_line, end_line, symbol,
             similarity, verdict, code_mechanism, reasoning, evidence,
-            confidence, tool_calls)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            confidence, tool_calls, downgrade_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             finding.run_id, finding.incident_ref, finding.file_path,
             finding.start_line, finding.end_line, finding.symbol,
             finding.similarity, finding.verdict, finding.code_mechanism,
             finding.reasoning, finding.evidence, finding.confidence,
-            finding.tool_calls,
+            finding.tool_calls, finding.downgrade_reason,
         ),
     )
     conn.commit()
@@ -291,10 +345,10 @@ def record_finding(conn: sqlite3.Connection, finding) -> int:
 
 def record_tool_call(conn: sqlite3.Connection, call: ToolCallRecord) -> int:
     cur = conn.execute(
-        """INSERT INTO tool_calls (run_id, chunk_symbol, seq, tool_name, args_json, result_summary, ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tool_calls (run_id, chunk_symbol, seq, tool_name, args_json, result_summary, ms, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (call.run_id, call.chunk_symbol, call.seq, call.tool_name,
-         call.args_json, call.result_summary, call.ms),
+         call.args_json, call.result_summary, call.ms, call.note),
     )
     conn.commit()
     return cur.lastrowid

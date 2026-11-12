@@ -40,13 +40,24 @@ class RoleRunner(Protocol):
     ) -> Transcript: ...
 
 
-def _stopped_reason(budget: ToolBudget, steps: list, final_text: str) -> Literal["model_finished", "call_cap", "wall_clock_cap"]:
-    if final_text:
-        return "model_finished"
-    if budget.elapsed_seconds() > budget.wall_clock_seconds:
-        return "wall_clock_cap"
-    if len(steps) >= budget.max_calls:
-        return "call_cap"
+StoppedReason = Literal["model_finished", "call_cap", "wall_clock_cap", "error"]
+
+
+def _stopped_reason(budget: ToolBudget, steps: list, final_text: str) -> StoppedReason:
+    """Why the tool loop ended, from what actually happened (audit B13),
+    not from whether final text exists: a capped loop that still wrote a
+    summary was reported as "model_finished" before.
+
+    - the first cap event (a call refused by the call cap or the wall
+      clock, or the runner's outer safety net cutting the loop) wins;
+    - otherwise "error" if a tool raised and the model gave no answer;
+    - otherwise "model_finished".
+    """
+    for event in budget.events:
+        if event in ("call_cap", "wall_clock_cap"):
+            return event
+    if not final_text and "error" in budget.events:
+        return "error"
     return "model_finished"
 
 
@@ -81,9 +92,11 @@ class ADKRoleRunner:
         # ADK's own hard safety net, set a few calls above our budget's
         # cap: belt and braces in case the model ignores the budget's
         # stop-and-answer message entirely.
-        final_text = await _agents().run_tooled_adk(
+        final_text, hit_llm_call_limit = await _agents().run_tooled_adk(
             instruction, prompt, wrapped, max_llm_calls=budget.max_calls + 4, think=think, on_text=on_text
         )
+        if hit_llm_call_limit:
+            budget.record_event("call_cap")
         return Transcript(steps=steps, final_text=final_text, stopped_reason=_stopped_reason(budget, steps, final_text))
 
 
@@ -177,5 +190,8 @@ class DirectOllamaRunner:
                 fn = by_name.get(name)
                 result = fn(**args) if fn else f"error: unknown tool {name!r}"
                 messages.append({"role": "tool", "tool_name": name, "content": str(result)})
+        else:
+            # The outer safety net ran out before the model stopped calling tools.
+            budget.record_event("call_cap")
 
         return Transcript(steps=steps, final_text=final_text, stopped_reason=_stopped_reason(budget, steps, final_text))

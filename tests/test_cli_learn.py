@@ -154,3 +154,84 @@ async def test_b10_failed_write_incident_reports_no_incident_written(learn_sandb
     out = capsys.readouterr().out
     assert "No incident was written." in out
     assert "Learned/updated" not in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 3, audit B15: learn runs and their tool calls are persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b15_postmortem_learn_records_a_run_and_its_tool_calls(learn_sandbox, tmp_path, monkeypatch):
+    monkeypatch.setattr(_ScriptedArchivist, "calls", [("read_file", {"file_path": "../.env"})])
+    await cli.cmd_learn(_base_args(postmortem_path="postmortems/incident.md"))
+
+    conn = store_mod.connect(tmp_path / "test.db")
+    runs = conn.execute("SELECT * FROM runs").fetchall()
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["mission"] == "learn"
+    assert run["scope"] == "postmortem:postmortems/incident.md"
+    assert (run["n_investigated"], run["n_tool_calls"], run["n_written"]) == (1, 2, 0)
+    assert run["finished_at"] is not None and run["ms_total"] is not None
+
+    calls = conn.execute("SELECT * FROM tool_calls ORDER BY seq").fetchall()
+    assert [(c["run_id"], c["tool_name"], c["note"]) for c in calls] == [
+        (run["run_id"], "read_file", None),
+        (run["run_id"], "read_file", "error"),  # ../.env escapes the postmortem's folder
+    ]
+    assert {c["chunk_symbol"] for c in calls} == {"postmortem:postmortems/incident.md"}
+
+
+class _GitArchivist:
+    """Reads the commit named in the prompt, then stops without writing."""
+
+    async def run_tooled(self, instruction, prompt, tools, budget, think=True, on_step=None, on_text=None):
+        wrapped, steps = tools_mod.budgeted_tools(tools, budget, on_step=on_step)
+        by_name = {fn.__name__: fn for fn in wrapped}
+        sha = re.search(r"commit '([0-9a-f]+)'", prompt).group(1)
+        by_name["read_commit"](sha=sha)
+        return Transcript(steps=steps, final_text="nothing worth remembering", stopped_reason="model_finished")
+
+
+@pytest.mark.asyncio
+async def test_b15_git_learn_records_one_run_with_a_label_per_commit(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@test.com")
+    git("config", "user.name", "Test")
+    (repo / "a.py").write_text("x = 1\n")
+    git("add", "a.py")
+    git("commit", "-qm", "fix: something worth remembering")
+    sha = git("rev-parse", "HEAD")
+
+    monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(runners, "ADKRoleRunner", _GitArchivist)
+    real_connect = store_mod.connect
+    monkeypatch.setattr(store_mod, "connect", lambda *a, **k: real_connect(tmp_path / "test.db"))
+
+    await cli.cmd_learn(_base_args(from_git="HEAD", repo=str(repo)))
+
+    conn = real_connect(tmp_path / "test.db")
+    [run] = conn.execute("SELECT * FROM runs").fetchall()
+    assert (run["mission"], run["scope"], run["n_investigated"], run["n_written"]) == ("learn", "git:HEAD", 1, 0)
+    [call] = conn.execute("SELECT * FROM tool_calls").fetchall()
+    assert (call["run_id"], call["tool_name"], call["chunk_symbol"]) == (run["run_id"], "read_commit", f"git:{sha[:12]}")
+
+
+@pytest.mark.asyncio
+async def test_b15_learn_dry_run_records_no_run(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    real_connect = store_mod.connect
+    monkeypatch.setattr(store_mod, "connect", lambda *a, **k: real_connect(tmp_path / "test.db"))
+
+    await cli.cmd_learn(_base_args(from_git="HEAD", repo=str(repo), dry_run=True))
+
+    assert real_connect(tmp_path / "test.db").execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
