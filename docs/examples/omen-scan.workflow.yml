@@ -1,0 +1,41 @@
+# EXAMPLE ONLY. Documented, never run by this repository's own CI (it lives
+# under docs/, not .github/workflows/). Copy it to .github/workflows/ in a
+# repository that has a self-hosted runner with a GPU, Ollama running, and the
+# models pulled (see docs/OUTPUTS.md, "Self-hosted GPU runner").
+#
+# What it does: scan the pull request's changes against the incident ledger,
+# upload the findings to GitHub code scanning as SARIF, and fail the job if a
+# finding is confirmed (exit code 2).
+name: Omen scan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write # upload-sarif
+
+jobs:
+  omen:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    env:
+      # A persistent ledger on the runner, seeded once with `omen seed` + `omen reindex`.
+      OMEN_HOME: /srv/omen/store
+      ANONYMIZED_TELEMETRY: "FALSE"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # `--since` needs the base branch's history
+
+      - name: Install Omen
+        run: python -m pip install "git+https://github.com/<org>/Local-OMEN@<tag-or-commit>"
+
+      - name: Scan the pull request
+        run: omen scan --since origin/${{ github.base_ref }} --profile gpu --format sarif --output omen.sarif --fail-on confirmed
+
+      - name: Upload findings to code scanning
+        if: always() # also when --fail-on stopped the previous step
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: omen.sarif

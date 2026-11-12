@@ -1,0 +1,13 @@
+# Hooks that this repository provides to pre-commit (https://pre-commit.com).
+# Usage and requirements: docs/OUTPUTS.md, "Pre-commit".
+- id: omen-scan
+  name: omen scan (repeats of past incidents)
+  description: >-
+    Scan the changed Python files against the incident ledger and fail the
+    commit on a confirmed repeat. Needs a running local Ollama with the Omen
+    models pulled, and a seeded ledger (OMEN_HOME or ./omen_store).
+  entry: omen scan --since HEAD --fail-on confirmed
+  language: python
+  types: [python]
+  pass_filenames: false
+  require_serial: true

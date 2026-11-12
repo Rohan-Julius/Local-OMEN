@@ -5,8 +5,9 @@ synchronous subcommands; `entrypoint()` is the sync wrapper behind the
 `omen` console script.
 
 Exit codes (audit B18): 0 success, 1 user error (bad arguments, a missing
-input file, an unknown ref, an empty ledger), 2 reserved for `--fail-on`
-(production plan Phase 7), 3 runtime or model error.
+input file, an unknown ref, an empty ledger), 2 `omen scan --fail-on`
+found a finding at or above the given level (production plan Phase 7),
+3 runtime or model error.
 
 ADK is imported only by commands that run a model (audit B28): runners.py
 is imported inside `_make_runner`, and runners.py imports agents.py (the
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -35,6 +37,7 @@ from omen import (
     librarian,
     profiles,
     prompts,
+    render,
     report,
     scout,
     sifter,
@@ -65,7 +68,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 EXIT_OK = 0
 EXIT_USER_ERROR = 1
-EXIT_FINDINGS = 2  # reserved: `--fail-on` (production plan Phase 7)
+EXIT_FINDINGS = 2  # `omen scan --fail-on` found a finding at or above the level
 EXIT_RUNTIME_ERROR = 3
 
 log = logging.getLogger("omen")
@@ -604,15 +607,17 @@ async def _triage_and_investigate(
     return findings
 
 
-async def cmd_scan(args: argparse.Namespace) -> int | None:
+async def _run_scan(args: argparse.Namespace) -> tuple[int | None, report.ScanReport | None]:
+    """The scan pipeline. Returns (exit code or None, report). The report is None for
+    --dry-run, --retrieval-only and early user errors, which have no findings to format."""
     if not Path(args.path).is_dir():
-        return _user_error(f"{args.path} is not a directory")
+        return _user_error(f"{args.path} is not a directory"), None
     if getattr(args, "max_gated", 0) < 0 or getattr(args, "max_positives", 0) < 0:
-        return _user_error("--max-gated and --max-positives must be 0 or more")
+        return _user_error("--max-gated and --max-positives must be 0 or more"), None
     if not args.dry_run and not store.list_incidents(store.connect()):
         # Nothing to match against: a scan cannot find anything, so say so
         # instead of embedding the code and recording an empty run.
-        return _user_error("the incident ledger is empty - run `omen seed <incidents.yaml>` and `omen reindex` first")
+        return _user_error("the incident ledger is empty - run `omen seed <incidents.yaml>` and `omen reindex` first"), None
     total_start = time.perf_counter()
     repo_path = Path(args.path).resolve()
     scout_watch = report.Stopwatch()
@@ -620,12 +625,13 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
         scope_result = scout.resolve_scope(repo_path, since=args.since, all_files=args.all)
         chunks = scout.chunk_files(scope_result.files, repo_root=repo_path)
     print(f"scope: {scope_result.scope}  ({len(scope_result.files)} file(s), {len(chunks)} chunk(s))")
-    if not chunks:
-        return
+    if not chunks:  # nothing to scan: the machine formats still emit an empty report
+        empty = report.ScanReport(repo_path, scope_result.scope, None, report.ScanStats(n_files=len(scope_result.files)), ran_pipeline=False)
+        return None, empty
 
     if args.dry_run:
         _print_chunk_table(chunks)
-        return
+        return None, None
 
     conn = store.connect()
 
@@ -637,13 +643,13 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
 
     if args.retrieval_only:
         if not gated:
-            return
+            return None, None
         for gc in gated:
             c = gc.chunk
             print(f"\n{c.file_path}:{c.symbol}  ({c.start_line}-{c.end_line})")
             for cand in gc.candidates:
                 print(f"    {cand.incident_ref}  {cand.similarity:.3f}  {cand.matched_variant}")
-        return
+        return None, None
 
     if gated:  # nothing gated means no LLM call, so no warm-up either
         await _prepare_llm(args)
@@ -667,7 +673,80 @@ async def cmd_scan(args: argparse.Namespace) -> int | None:
     # From the start of the command: Scout and embedding included (audit B14).
     stats.ms_total = round((time.perf_counter() - total_start) * 1000)
     store.finish_run(conn, run_id, **stats.as_run_fields())
-    report.print_summary(stats, findings)
+    return None, report.ScanReport(
+        repo_path=repo_path,
+        scope=scope_result.scope,
+        run_id=run_id,
+        stats=stats,
+        findings=findings,
+        incidents=store.list_incidents(conn),
+        runner=args.runner,
+        llm_model=config.LLM_MODEL,
+        embed_model=config.EMBED_MODEL,
+    )
+
+
+
+def _fail_on_code(scan_report: report.ScanReport, fail_on: str | None) -> int | None:
+    """`--fail-on confirmed|unverified` (production plan Phase 7): EXIT_FINDINGS if the scan
+    has a finding at or above that level, for CI and pre-commit. `rejected` never counts. A
+    Triage-positive chunk that a cap kept from being investigated is not a finding, so it cannot
+    fail the run, but it is said out loud on stderr: the exit code does not cover it."""
+    if fail_on is None:
+        return None
+    levels = {"confirmed": ("confirmed",), "unverified": ("confirmed", "unverified")}[fail_on]
+    uninvestigated = [s for s in scan_report.stats.skipped if s.stage == "investigation"]
+    if uninvestigated:
+        print(
+            f"warning: {len(uninvestigated)} Triage-positive chunk(s) were not investigated because of --max-positives; "
+            "the --fail-on result does not cover them",
+            file=sys.stderr,
+        )
+    hits = [f for f in scan_report.findings if f.verdict in levels]
+    if hits:
+        print(f"--fail-on {fail_on}: {len(hits)} finding(s) at or above that level", file=sys.stderr)
+        return EXIT_FINDINGS
+    return None
+
+
+def _write_report(text: str, output: str | None) -> None:
+    if output is None:
+        print(text.rstrip("\n"))
+        return
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8", newline="\n")
+    print(f"report written to {path}", file=sys.stderr)
+
+
+async def cmd_scan(args: argparse.Namespace) -> int | None:
+    """`omen scan` (production plan Phase 7: `--format`, `--output`, `--fail-on`).
+
+    `text` (the default) prints progress and then the summary on stdout, as before.
+    `markdown`, `json` and `sarif` print ONLY the document on stdout (progress goes to
+    stderr), or write it to `--output`. With `--fail-on`, exit code 2 means the scan
+    found a finding at or above the level."""
+    fmt = getattr(args, "format", "text")
+    output = getattr(args, "output", None)
+    fail_on = getattr(args, "fail_on", None)
+    if (fmt != "text" or output or fail_on) and (args.dry_run or args.retrieval_only):
+        return _user_error("--format, --output and --fail-on apply to a full scan, not to --dry-run or --retrieval-only")
+
+    if fmt == "text":
+        code, scan_report = await _run_scan(args)
+    else:
+        with contextlib.redirect_stdout(sys.stderr):  # keep stdout clean for the document
+            code, scan_report = await _run_scan(args)
+    if code is not None:
+        return code
+    if scan_report is None:
+        return None
+
+    if fmt != "text":
+        _write_report(render.render(fmt, scan_report), output)
+    elif scan_report.ran_pipeline:
+        _write_report(render.render("text", scan_report), output)
+    return _fail_on_code(scan_report, fail_on)
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int | None:
@@ -993,6 +1072,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=config.MAX_POSITIVES,
         metavar="N",
         help=f"Investigate at most N Triage-positive chunks; the rest are reported and stored as Triage-positive (default {config.MAX_POSITIVES})",
+    )
+    p_scan.add_argument(
+        "--format",
+        choices=render.FORMATS,
+        default="text",
+        help="Report format: text (default, progress then a summary), markdown, json or sarif (2.1.0). "
+        "Everything but text prints only the document on stdout; progress goes to stderr.",
+    )
+    p_scan.add_argument("--output", metavar="FILE", default=None, help="Write the report to FILE instead of stdout")
+    p_scan.add_argument(
+        "--fail-on",
+        choices=["confirmed", "unverified"],
+        default=None,
+        help="Exit with code 2 if a finding at or above this level exists (unverified includes confirmed)",
     )
     p_scan.add_argument("--no-warmup", action="store_true", help="Skip the throwaway warm-up generation before the first LLM call")
     p_scan.set_defaults(func=cmd_scan)

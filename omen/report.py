@@ -5,9 +5,9 @@ called directly from `cli.py`, which already owns per-role progress
 printing — this module owns only the timing/counting used to build both
 the terminal summary and the `RunRecord` passed to `store.finish_run`,
 so, per PLAN.md, "screen and DB timings come from the same measurements"
-rather than two stopwatches that could quietly disagree. Markdown
-rendering is out of scope here — PLAN.md defers it past the schedule
-("Markdown report — already deferred; terminal only").
+rather than two stopwatches that could quietly disagree. The other
+report formats (markdown, json, sarif; production plan Phase 7) are in
+render.py and are built from the same `ScanReport`.
 """
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
+
+from pathlib import Path
 
 from omen.contracts import Finding, SkippedChunk
 
@@ -79,44 +81,75 @@ class ScanStats:
         }
 
 
-def print_skipped(skipped: list[SkippedChunk]) -> None:
+@dataclass
+class ScanReport:
+    """Everything one `omen scan` produced, as the input of every output
+    format (render.py) and of `--fail-on`. `ran_pipeline` is False when the
+    scan found nothing to scan (no changed Python files): the machine
+    formats still emit an empty report, the text format prints nothing more."""
+
+    repo_path: Path
+    scope: str
+    run_id: str | None
+    stats: ScanStats
+    findings: list = field(default_factory=list)  # list[Finding]
+    incidents: list = field(default_factory=list)  # list[Incident]: the whole ledger, for SARIF rules
+    runner: str | None = None
+    llm_model: str | None = None
+    embed_model: str | None = None
+    ran_pipeline: bool = True
+
+
+def skipped_lines(skipped: list[SkippedChunk]) -> list[str]:
     """Chunks a cap kept from being triaged or investigated. They are stored
     in `skipped_chunks` too: a cap must never hide a candidate."""
     triage = [s for s in skipped if s.stage == "triage"]
     investigation = [s for s in skipped if s.stage == "investigation"]
-    print(f"skipped {len(skipped)} chunk(s) because of caps (stored in `skipped_chunks`, raise the cap to process them):")
+    out = [f"skipped {len(skipped)} chunk(s) because of caps (stored in `skipped_chunks`, raise the cap to process them):"]
     for label, group in (("not triaged", triage), ("Triage-positive, not investigated", investigation)):
         if group:
-            print(f"  {label}: {len(group)}")
+            out.append(f"  {label}: {len(group)}")
             for s in group:
-                print(f"    {s.file_path}:{s.symbol or '?'}  similarity={s.similarity:.3f}  {s.reason}")
+                out.append(f"    {s.file_path}:{s.symbol or '?'}  similarity={s.similarity:.3f}  {s.reason}")
+    return out
 
 
-def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
-    print("\n" + "=" * 60)
-    print(
+def print_skipped(skipped: list[SkippedChunk]) -> None:
+    for line in skipped_lines(skipped):
+        print(line)
+
+
+def summary_lines(stats: ScanStats, findings: list[Finding]) -> list[str]:
+    """The terminal summary, one string per line (the first is blank)."""
+    out = ["", "=" * 60]
+    out.append(
         f"scan complete in {stats.ms_total / 1000:.1f}s — {stats.n_chunks} chunk(s), "
         f"{stats.n_gated} gated, {stats.n_triaged} triaged, {stats.n_investigated} investigated, "
         f"{stats.n_tool_calls} tool call(s)"
     )
-    print(
+    out.append(
         f"  scout {stats.ms_scout / 1000:.1f}s  embed {stats.ms_embed / 1000:.1f}s  "
         f"triage {stats.ms_triage / 1000:.1f}s  investigate {stats.ms_investigate / 1000:.1f}s  "
         f"adjudicate {stats.ms_adjudicate / 1000:.1f}s"
     )
 
     if stats.skipped:
-        print_skipped(stats.skipped)
+        out += skipped_lines(stats.skipped)
 
     if not findings:
-        print("no findings.")
-        return
+        out.append("no findings.")
+        return out
 
     for f in findings:
         span = f"{f.start_line}-{f.end_line}" if f.start_line is not None and f.end_line is not None else "?"
-        print(f"\n[{f.verdict.upper()}] {f.incident_ref}  {f.file_path}:{f.symbol or '?'} ({span})")
-        print(f"  mechanism: {f.code_mechanism}")
+        out.append(f"\n[{f.verdict.upper()}] {f.incident_ref}  {f.file_path}:{f.symbol or '?'} ({span})")
+        out.append(f"  mechanism: {f.code_mechanism}")
         if f.evidence:
-            print(f"  evidence: {f.evidence}")
+            out.append(f"  evidence: {f.evidence}")
         if f.downgrade_reason:
-            print(f"  downgraded from confirmed: {f.downgrade_reason}")
+            out.append(f"  downgraded from confirmed: {f.downgrade_reason}")
+    return out
+
+
+def print_summary(stats: ScanStats, findings: list[Finding]) -> None:
+    print("\n".join(summary_lines(stats, findings)))
