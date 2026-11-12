@@ -1,0 +1,316 @@
+# Held-out evaluation set (production plan Phase 6): 24 labeled chunks, 8 per
+# class. NEVER used for tuning: not for the similarity threshold, not for
+# prompt wording, not for incidents.yaml surface forms. If a result here
+# looks bad, report it; do not edit a prompt or a threshold until it looks
+# better and then report the same file again. Tuning data lives in
+# fixtures/calibration.yaml.
+#
+# Written in different domains from the calibration set (which covers a
+# permission lookup, a DB reconnect loop, a login log line, seat booking, a
+# thumbnail cache, stock counts and small utilities): this set uses API
+# tokens, webhooks, archive storage, coupons, chat rooms, reports, sensor
+# data, billing clocks, and so on.
+#
+# Honesty rules for every entry:
+# - true_match: the code really shares the mechanism of `target_ref`
+#   (see incidents.yaml), so a reviewer who knew that incident would flag it.
+# - hard_negative: shares vocabulary or shape with an incident, but the
+#   mechanism is absent: either it is already prevented in the code, or it
+#   cannot occur there.
+# - unrelated: nothing to do with any incident mechanism.
+# Each entry has a unique file_path and none of this code appears in
+# omen/prompts/ (tests/test_evaluation.py checks both).
+
+fixtures:
+  # --- true matches (target incidents are those in incidents.yaml) ---------
+
+  - id: HT1
+    label: true_match
+    target_ref: OMEN-001
+    file_path: heldout/api_tokens.py
+    symbol: token_allows
+    code: |
+      _scope_cache = {}
+
+      def token_allows(token_id, scope):
+          key = (token_id, scope)
+          if key not in _scope_cache:
+              _scope_cache[key] = _lookup_scope_grant(token_id, scope)
+          return _scope_cache[key]
+
+  - id: HT2
+    label: true_match
+    target_ref: OMEN-002
+    file_path: heldout/webhooks.py
+    symbol: deliver_webhook
+    code: |
+      @app.task(bind=True, max_retries=8)
+      def deliver_webhook(self, endpoint, payload):
+          try:
+              requests.post(endpoint, json=payload, timeout=5).raise_for_status()
+          except requests.RequestException as exc:
+              raise self.retry(exc=exc, countdown=30)
+
+  - id: HT3
+    label: true_match
+    target_ref: OMEN-003
+    file_path: heldout/archive_storage.py
+    symbol: open_archive_client
+    code: |
+      def open_archive_client(host, user, password):
+          dsn = f"postgresql://{user}:{password}@{host}/archive"
+          try:
+              return create_engine(dsn).connect()
+          except Exception as exc:
+              logger.info("archive connect failed dsn=%s error=%s", dsn, exc)
+              raise
+
+  - id: HT4
+    label: true_match
+    target_ref: OMEN-004
+    file_path: heldout/coupons.py
+    symbol: redeem_coupon
+    code: |
+      def redeem_coupon(code, order):
+          coupon = Coupon.get(code)
+          if coupon.uses_left > 0:
+              apply_discount(order, coupon)
+              coupon.uses_left -= 1
+              coupon.save()
+          else:
+              raise CouponExhausted(code)
+
+  - id: HT5
+    label: true_match
+    target_ref: OMEN-004
+    file_path: heldout/chat_rooms.py
+    symbol: join_room
+    code: |
+      def join_room(room, user):
+          if len(room.members) < room.capacity:
+              room.members.append(user)
+              room.save()
+              return True
+          return False
+
+  - id: HT6
+    label: true_match
+    target_ref: OMEN-005
+    file_path: heldout/reports.py
+    symbol: export_orders_csv
+    code: |
+      def export_orders_csv(path):
+          orders = session.query(Order).all()
+          with open(path, "w", newline="") as fh:
+              writer = csv.writer(fh)
+              for o in orders:
+                  writer.writerow([o.id, o.customer_id, o.total])
+
+  - id: HT7
+    label: true_match
+    target_ref: OMEN-005
+    file_path: heldout/sensor_store.py
+    symbol: load_all_sensor_readings
+    code: |
+      def load_all_sensor_readings(conn):
+          cur = conn.cursor()
+          cur.execute("SELECT device_id, ts, value FROM readings")
+          return cur.fetchall()
+
+  - id: HT8
+    label: true_match
+    target_ref: OMEN-006
+    file_path: heldout/trials.py
+    symbol: trial_has_ended
+    code: |
+      def trial_has_ended(account):
+          # account.trial_ends_at is a naive datetime holding UTC, as stored in the database
+          return datetime.now() >= account.trial_ends_at
+
+  # --- hard negatives (vocabulary or shape of an incident, mechanism absent) ---
+
+  # Cached authorization decision, but the permission-changing event invalidates it.
+  - id: HH1
+    label: hard_negative
+    file_path: heldout/session_roles.py
+    symbol: role_for
+    code: |
+      _role_cache = {}
+
+      def role_for(user_id):
+          if user_id not in _role_cache:
+              _role_cache[user_id] = _load_role(user_id)
+          return _role_cache[user_id]
+
+      def change_role(user_id, new_role):
+          _save_role(user_id, new_role)
+          _role_cache.pop(user_id, None)
+
+  # Memoized access decision, but it depends only on an immutable constant:
+  # nothing can change it while the process runs, and a deploy restarts the cache.
+  - id: HH2
+    label: hard_negative
+    file_path: heldout/routing.py
+    symbol: is_public_path
+    code: |
+      PUBLIC_PREFIXES = ("/static/", "/healthz", "/login")
+
+      @functools.lru_cache(maxsize=None)
+      def is_public_path(path):
+          return path.startswith(PUBLIC_PREFIXES)
+
+  # Retry on a countdown, but exponential with full jitter and a ceiling.
+  - id: HH3
+    label: hard_negative
+    file_path: heldout/inventory_sync.py
+    symbol: sync_inventory
+    code: |
+      @app.task(bind=True, max_retries=8)
+      def sync_inventory(self, warehouse_id):
+          try:
+              _push_levels(warehouse_id)
+          except TransientError as exc:
+              delay = min(2 ** self.request.retries, 300)
+              raise self.retry(exc=exc, countdown=delay + random.randint(0, delay))
+
+  # Names a secret in a log line, but never writes its value.
+  - id: HH4
+    label: hard_negative
+    file_path: heldout/service_auth.py
+    symbol: authenticate_service
+    code: |
+      def authenticate_service(client_id, client_secret):
+          logger.info("authenticating service client_id=%s has_secret=%s", client_id, bool(client_secret))
+          token = _exchange_credentials(client_id, client_secret)
+          logger.info("token issued for client_id=%s", client_id)
+          return token
+
+  # Read, check, write, but inside one transaction holding a row lock.
+  - id: HH5
+    label: hard_negative
+    file_path: heldout/ledger.py
+    symbol: withdraw
+    code: |
+      def withdraw(account_id, amount):
+          with transaction.atomic():
+              account = Account.objects.select_for_update().get(pk=account_id)
+              if account.balance < amount:
+                  raise InsufficientFunds(account_id)
+              account.balance -= amount
+              account.save()
+
+  # "Check then create" collapsed into one atomic operation (O_EXCL).
+  - id: HH6
+    label: hard_negative
+    file_path: heldout/pidfile.py
+    symbol: acquire_pidfile
+    code: |
+      def acquire_pidfile(path):
+          fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+          os.write(fd, str(os.getpid()).encode())
+          return fd
+
+  # fetchall(), but of one bounded page of a keyset-paginated query.
+  - id: HH7
+    label: hard_negative
+    file_path: heldout/readings_api.py
+    symbol: readings_page
+    code: |
+      def readings_page(conn, after_id, limit=500):
+          cur = conn.cursor()
+          cur.execute(
+              "SELECT id, device_id, ts, value FROM readings WHERE id > %s ORDER BY id LIMIT %s",
+              (after_id, limit),
+          )
+          return cur.fetchall()
+
+  # Time zones and datetimes, but timezone-aware UTC end to end; local time only for display.
+  - id: HH8
+    label: hard_negative
+    file_path: heldout/display_time.py
+    symbol: format_for_display
+    code: |
+      def format_for_display(utc_timestamp, user_tz):
+          # utc_timestamp is a timezone-aware UTC datetime, as stored; converted only here, for display
+          local = utc_timestamp.astimezone(ZoneInfo(user_tz))
+          return local.strftime("%Y-%m-%d %H:%M %Z")
+
+  # --- unrelated -----------------------------------------------------------
+
+  - id: HU1
+    label: unrelated
+    file_path: heldout/units.py
+    symbol: celsius_to_fahrenheit
+    code: |
+      def celsius_to_fahrenheit(c):
+          return c * 9 / 5 + 32
+
+  - id: HU2
+    label: unrelated
+    file_path: heldout/seqtools.py
+    symbol: chunked
+    code: |
+      def chunked(seq, size):
+          return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+  - id: HU3
+    label: unrelated
+    file_path: heldout/colors.py
+    symbol: Rgb
+    code: |
+      @dataclass(frozen=True)
+      class Rgb:
+          red: int
+          green: int
+          blue: int
+
+          def hex(self):
+              return f"#{self.red:02x}{self.green:02x}{self.blue:02x}"
+
+  - id: HU4
+    label: unrelated
+    file_path: heldout/naming.py
+    symbol: to_snake_case
+    code: |
+      def to_snake_case(name):
+          return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+  - id: HU5
+    label: unrelated
+    file_path: heldout/geometry.py
+    symbol: haversine_km
+    code: |
+      def haversine_km(lat1, lon1, lat2, lon2):
+          p1, p2 = math.radians(lat1), math.radians(lat2)
+          dp, dl = p2 - p1, math.radians(lon2 - lon1)
+          a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+          return 2 * 6371.0 * math.asin(math.sqrt(a))
+
+  - id: HU6
+    label: unrelated
+    file_path: heldout/versioning.py
+    symbol: parse_semver
+    code: |
+      def parse_semver(text):
+          major, minor, patch = text.split(".")
+          return int(major), int(minor), int(patch)
+
+  - id: HU7
+    label: unrelated
+    file_path: heldout/wordstats.py
+    symbol: top_words
+    code: |
+      def top_words(text, n=5):
+          words = re.findall(r"[a-z']+", text.lower())
+          return collections.Counter(words).most_common(n)
+
+  - id: HU8
+    label: unrelated
+    file_path: heldout/arguments.py
+    symbol: build_parser
+    code: |
+      def build_parser():
+          parser = argparse.ArgumentParser(description="Convert image files")
+          parser.add_argument("source")
+          parser.add_argument("--width", type=int, default=800)
+          return parser

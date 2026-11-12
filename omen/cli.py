@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +29,7 @@ from omen import (
     config,
     doctor as doctor_mod,
     errors,
+    evaluation,
     evidence,
     fixtures as fixtures_mod,
     librarian,
@@ -717,6 +719,119 @@ def cmd_calibrate(args: argparse.Namespace) -> int | None:
     )
 
 
+async def cmd_eval(args: argparse.Namespace) -> int | None:
+    """Production plan Phase 6: run retrieval + Triage (and, with --full, the
+    Investigator and Adjudicator) over a labeled fixture file, by default the
+    held-out set that is never used for tuning, and report per-class
+    survivors, confusion counts, precision and recall for every stage. The
+    result is also written to <results-dir>/results-<date>.json."""
+    if not Path(args.fixtures_path).is_file():
+        return _user_error(f"{args.fixtures_path} is not a file (pass --fixtures-path)")
+    if args.full and args.retrieval_only:
+        return _user_error("--full and --retrieval-only cannot be combined")
+    cases = fixtures_mod.load_fixtures(Path(args.fixtures_path))
+    if not cases:
+        return _user_error(f"{args.fixtures_path} has no fixtures")
+    conn = store.connect()
+    if not store.list_incidents(conn):
+        return _user_error("the incident ledger is empty - run `omen seed <incidents.yaml>` and `omen reindex` first")
+
+    chunks = [fixtures_mod.fixture_to_chunk(c) for c in cases]
+    embeddings, embed_stats = librarian.embed_chunks(conn, chunks)
+    print(f"embed cache: {embed_stats.n_cache_hits}/{embed_stats.n_total} hits")
+    all_hits = vectors.query_chunks([embeddings[c.content_hash] for c in chunks], n_results=librarian.QUERY_N_RESULTS)
+    threshold = librarian.SIMILARITY_THRESHOLD
+    results = [
+        evaluation.CaseResult(case=case, candidates=librarian.collapse_to_incidents(hits), threshold=threshold)
+        for case, hits in zip(cases, all_hits)
+    ]
+
+    stages: tuple[str, ...] = ("retrieval",)
+    profile_name = None
+    if not args.retrieval_only:
+        stages = ("retrieval", "triage", "full") if args.full else ("retrieval", "triage")
+        to_triage = [(r, c) for r, c in zip(results, chunks) if r.gated]
+        if to_triage:  # nothing gated means no LLM call, so no warm-up either
+            profile_name = (await _prepare_llm(args)).name
+            runner = _make_runner(args.runner)
+            await _eval_triage(conn, runner, to_triage)
+            if args.full:
+                await _eval_full(conn, runner, [(r, c) for r, c in to_triage if r.positive_at("triage")])
+
+    report = evaluation.build_report(
+        results,
+        stages,
+        fixtures_path=Path(args.fixtures_path),
+        meta={
+            "threshold": threshold,
+            "runner": None if args.retrieval_only else args.runner,
+            "profile": profile_name,
+            "llm_model": config.LLM_MODEL,
+            "embed_model": config.EMBED_MODEL,
+            "prompt_sha256": {name: prompts.sha256(name) for name in ("triage.txt", "investigator.txt", "adjudicator.txt")},
+        },
+    )
+    print()
+    for line in evaluation.render(report):
+        print(line)
+    path = evaluation.write_results(report, Path(args.results_dir))
+    print(f"\nwrote {path}")
+
+
+async def _eval_triage(conn, runner, pairs) -> None:
+    instruction = prompts.load_prompt("triage.txt")
+    for i, (result, chunk) in enumerate(pairs, 1):
+        prompt = _format_triage_prompt(conn, chunk, result.gated)
+        verdict = await runner.run_structured(instruction, prompt, TriageVerdict, think=config.THINK_DEFAULT)
+        result.triage = verdict.model_dump()
+        print(f"[triage {i}/{len(pairs)}] {result.case.id} ({result.case.label}): {verdict.verdict}")
+
+
+async def _eval_full(conn, runner, pairs) -> None:
+    """Investigator + Adjudicator for the Triage-positive cases. A fixture is
+    only a snippet, so each case's code is written to a temporary repo
+    (under its own id, so two fixtures sharing a file name cannot collide)
+    for the Investigator's read tools to look at."""
+    investigator_instruction = prompts.load_prompt("investigator.txt")
+    adjudicator_instruction = prompts.load_prompt("adjudicator.txt")
+    with tempfile.TemporaryDirectory(prefix="omen-eval-") as tmp:
+        repo = Path(tmp)
+        for i, (result, chunk) in enumerate(pairs, 1):
+            rel = f"{result.case.id}/{result.case.file_path}"
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(chunk.content, encoding="utf-8")
+            chunk = chunk.model_copy(update={"file_path": rel})
+            candidates = result.gated
+            transcript = await runner.run_tooled(
+                investigator_instruction,
+                _format_investigator_prompt(conn, chunk, candidates),
+                tools_mod.build_scan_tools(repo, conn),
+                tools_mod.ToolBudget(),
+                think=profiles.active().investigator_think,
+            )
+            schema = adjudicator_schema([c.incident_ref for c in candidates])
+            raw = await runner.run_structured(
+                adjudicator_instruction,
+                _format_adjudicator_prompt(conn, chunk, candidates, transcript),
+                schema,
+                think=config.THINK_DEFAULT,
+            )
+            final, downgrade_reason = evidence.validate_confirmed(raw, chunk, transcript, repo)
+            result.full = {
+                "raw_verdict": raw.verdict,
+                "verdict": final.verdict,
+                "incident_ref": final.incident_ref,
+                "downgrade_reason": downgrade_reason,
+                "stopped_reason": transcript.stopped_reason,
+                "tool_calls": len(transcript.steps),
+                "reasoning": final.reasoning,
+            }
+            print(
+                f"[full {i}/{len(pairs)}] {result.case.id} ({result.case.label}): {final.verdict} "
+                f"{final.incident_ref} ({len(transcript.steps)} tool call(s), {transcript.stopped_reason})"
+            )
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse exits with 2 on bad arguments; Omen reserves 2 for
     `--fail-on` (Phase 7), so argument errors exit 1 like every other user
@@ -882,9 +997,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--no-warmup", action="store_true", help="Skip the throwaway warm-up generation before the first LLM call")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_calibrate = sub.add_parser("calibrate", help="Sweep the similarity floor over fixtures/fixtures.yaml")
+    p_calibrate = sub.add_parser("calibrate", help="Sweep the similarity floor over fixtures/calibration.yaml (the tuning set)")
     p_calibrate.add_argument("--fixtures-path", default=str(fixtures_mod.DEFAULT_FIXTURES_PATH))
     p_calibrate.set_defaults(func=cmd_calibrate)
+
+    p_eval = sub.add_parser(
+        "eval", help="Measure retrieval + Triage (+ the full pipeline) on the held-out fixtures: precision, recall, confusion counts"
+    )
+    p_eval.add_argument("--fixtures-path", default=str(fixtures_mod.DEFAULT_HELDOUT_PATH), help="Labeled fixtures (default: the held-out set)")
+    p_eval.add_argument("--full", action="store_true", help="Also run the Investigator and Adjudicator on Triage-positive cases (slow)")
+    p_eval.add_argument("--retrieval-only", action="store_true", help="Retrieval only: embeddings and the similarity floor, no generation")
+    p_eval.add_argument("--runner", choices=["adk", "direct"], default="adk", help="adk (default) or direct")
+    p_eval.add_argument("--results-dir", default="eval", help="Where results-<date>.json is written (default: ./eval)")
+    p_eval.add_argument("--no-warmup", action="store_true", help="Skip the throwaway warm-up generation before the first LLM call")
+    p_eval.set_defaults(func=cmd_eval)
 
     return parser
 
@@ -916,7 +1042,7 @@ async def main(argv: list[str] | None = None) -> int:
         parser.error("argument -q/--quiet: not allowed with argument -v/--verbose")
     command = " ".join(filter(None, [args.command, getattr(args, "memory_command", None)]))
     _configure_logging(args.verbose, args.quiet)
-    if args.command in ("scan", "learn"):
+    if args.command in ("scan", "learn", "eval"):
         try:
             profiles.requested_name(args.profile)  # a bad OMEN_PROFILE is a user error, up front
         except ValueError as e:

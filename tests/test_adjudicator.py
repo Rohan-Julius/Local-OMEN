@@ -279,3 +279,92 @@ async def test_live_structured_adjudicator_returns_a_candidate_ref(runner_cls):
     assert isinstance(verdict, schema)
     assert verdict.incident_ref in ("OMEN-004", "OMEN-001")
     assert verdict.incident_ref == "OMEN-001", f"chose {verdict.incident_ref}: {verdict.reasoning}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (live, NOT run in Phase 6): the Adjudicator on a hard negative
+# ---------------------------------------------------------------------------
+#
+# `test_adjudicator_end_to_end[hard_negative]` returns early whenever Triage
+# rejects the chunk, so on its own it never shows what the Adjudicator does
+# with a hard negative. These tests skip Triage and the Investigator: they
+# hand the Adjudicator a hard-negative chunk and an investigation transcript
+# that already contains the evidence the chunk is safe, and assert it does not
+# confirm. Both chunks come from fixtures/calibration.yaml (HN1 and HN4); the
+# transcripts are written here, as a real Investigator would plausibly produce.
+
+HN_THUMBNAIL_PROMPT = """CODE CHUNK (thumbnails.py:get_thumbnail, lines 1-9):
+_thumb_cache = cachetools.TTLCache(maxsize=500, ttl=3600)
+
+def get_thumbnail(image_id):
+    if image_id in _thumb_cache:
+        return _thumb_cache[image_id]
+    thumb = render_thumbnail(image_id)
+    _thumb_cache[image_id] = thumb
+    return thumb
+
+CANDIDATE INCIDENTS:
+OMEN-001: Stale permission cache after revocation
+  failure_mechanism: An authorization decision is cached with no invalidation path tied to the permission-changing event, so a revoked or downgraded permission keeps succeeding until the cache entry expires on its own or the process restarts.
+  the_rule: Any cache keyed on an authorization decision must be invalidated explicitly by the event that changes the permission (role update, revocation, deactivation) - a TTL alone is not sufficient.
+
+INVESTIGATION TRANSCRIPT:
+  [1] read_code({'file_path': 'thumbnails.py', 'start_line': 1, 'end_line': 30}) -> _thumb_cache = cachetools.TTLCache(maxsize=500, ttl=3600)
+
+def get_thumbnail(image_id):
+    if image_id in _thumb_cache:
+        return _thumb_cache[image_id]
+    thumb = render_thumbnail(image_id)
+    _thumb_cache[image_id] = thumb
+    return thumb
+  [2] grep_symbol({'symbol': 'permission'}) -> []
+  [3] grep_symbol({'symbol': 'get_thumbnail'}) -> ['gallery.py:14: <img src=thumbnail_url(get_thumbnail(photo.id))>']
+
+INVESTIGATOR'S SUMMARY:
+get_thumbnail (thumbnails.py:3-8) caches a rendered image thumbnail keyed by image id in a TTLCache. Nothing in thumbnails.py reads a user, role or permission, and grep_symbol found no "permission" anywhere. The only caller (gallery.py:14) renders the result into an image tag. The cache holds rendered images, not an authorization decision.
+"""
+
+HN_ATOMIC_UPDATE_PROMPT = """CODE CHUNK (inventory.py:decrement_stock_atomic, lines 1-8):
+def decrement_stock_atomic(sku, count=1):
+    updated = db.execute(
+        "UPDATE stock SET quantity = quantity - %s WHERE sku = %s AND quantity >= %s",
+        (count, sku, count),
+    )
+    if updated.rowcount == 0:
+        raise OutOfStock()
+
+CANDIDATE INCIDENTS:
+OMEN-004: Check-then-act race condition without atomicity
+  failure_mechanism: Code reads some state, decides an action is safe based on that read, then performs the action in a separate step with no lock or transaction spanning both - so two concurrent callers can both pass the check and both perform the action, violating an invariant that was assumed to hold.
+  the_rule: Any check-then-act sequence on shared mutable state must be made atomic - a single `UPDATE ... WHERE` with the guard condition, a `SELECT ... FOR UPDATE`, or an equivalent compare-and-swap - not a read followed by a separate write.
+
+INVESTIGATION TRANSCRIPT:
+  [1] read_code({'file_path': 'inventory.py', 'start_line': 1, 'end_line': 20}) -> def decrement_stock_atomic(sku, count=1):
+    updated = db.execute(
+        "UPDATE stock SET quantity = quantity - %s WHERE sku = %s AND quantity >= %s",
+        (count, sku, count),
+    )
+    if updated.rowcount == 0:
+        raise OutOfStock()
+  [2] get_incident({'incident_ref': 'OMEN-004'}) -> the_rule: ... a single `UPDATE ... WHERE` with the guard condition ...
+
+INVESTIGATOR'S SUMMARY:
+decrement_stock_atomic (inventory.py:1-7) performs the guard and the decrement in one UPDATE statement (`quantity >= %s` in the WHERE clause) and checks the affected row count afterwards. There is no separate read of the quantity, so two concurrent callers cannot both pass a stale check. This is the fix that OMEN-004's rule prescribes, not the failure.
+"""
+
+
+@pytest.mark.live
+@pytest.mark.slow
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_cls", [runners.ADKRoleRunner, runners.DirectOllamaRunner], ids=["adk", "direct"])
+@pytest.mark.parametrize(
+    "prompt,ref",
+    [(HN_THUMBNAIL_PROMPT, "OMEN-001"), (HN_ATOMIC_UPDATE_PROMPT, "OMEN-004")],
+    ids=["thumbnail_cache", "atomic_update"],
+)
+async def test_live_adjudicator_does_not_confirm_a_hard_negative(runner_cls, prompt, ref):
+    schema = adjudicator_schema([ref])
+    verdict = await runner_cls().run_structured(prompts.load_prompt("adjudicator.txt"), prompt, schema, think=False)
+    print(f"\n{runner_cls.__name__} {ref}: verdict={verdict.verdict} confidence={verdict.confidence} "
+          f"evidence={verdict.evidence_lines} reasoning={verdict.reasoning}")
+    assert verdict.verdict != "confirmed", f"hard negative confirmed: {verdict.reasoning}"

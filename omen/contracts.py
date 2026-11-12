@@ -73,8 +73,8 @@ class GatedChunk(BaseModel):
 
 
 class FixtureCase(BaseModel):
-    """One labeled chunk in fixtures/fixtures.yaml (Phase 4 calibration and
-    the ongoing regression gate). `target_ref` is set only for
+    """One labeled chunk in fixtures/calibration.yaml or fixtures/heldout.yaml
+    (tuning set and evaluation set). `target_ref` is set only for
     true_match — hard_negative and unrelated fixtures should not clear
     the gate for any incident."""
 

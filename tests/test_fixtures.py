@@ -1,4 +1,6 @@
-"""Phase 4 acceptance, pinned as an ongoing regression gate: all 4 true
+"""Phase 4 acceptance, pinned as an ongoing regression gate over the TUNING set
+(fixtures/calibration.yaml; the held-out set is for `omen eval`, never for
+gates that guide tuning): all 4 true
 positives survive retrieval and at most 2 of the 4 hard negatives do, at
 the currently configured SIMILARITY_THRESHOLD. PLAN.md: this gates every
 prompt/config change — a change that lifts recall while wrecking

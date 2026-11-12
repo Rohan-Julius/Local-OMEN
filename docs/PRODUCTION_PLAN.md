@@ -283,6 +283,7 @@ Revisit only after Phase 8.
 | 2026-11-12 | 4 | `pytest -m "not live"`: **230 passed, 26 deselected** (256 tests; 47 new); coverage **92%**; `ruff check .` clean. `omen calibrate`: **unchanged** (0.35: TP 4/4, HN 2/4, unrelated 0/4; all 12 per-fixture scores identical). Live (CPU): `tests/test_tools.py -m live` **1 passed** (4.8 s). **The 4 Archivist tests FAILED** — `test_archivist.py::abstracts_and_spans_technologies` 454.5 s, `::dedups_on_second_run` 270.7 s, `test_archivist_git.py::records_pre_change_failure_not_the_fix` 502.2 s, `::git_dedups_on_second_run` 357.6 s — all with "Archivist never wrote an incident". **Cause: B5 part 2 (Phase 5), not a Phase 4 regression**: a diagnostic run of the postmortem scenario with steps printed showed `read_file` ok, `search_memory` ok (5.5 s), then `write_incident` **refused** (`wall-clock ceiling exceeded`) because the model's turn between the two calls took more than the 90 s tool wall clock on CPU; the model then claimed it had recorded the incident. `stopped_reason=wall_clock_cap` and `written_ref=None` ("No incident was written") were reported correctly. Tests and prompts not edited. | Fixed: **B8, B26**; history/undo, `omen doctor`, schema v3. **Merge semantics (B8):** `write_incident` with `existing_ref` calls `store.merge_incident`. Surface forms = union, existing first and never dropped, new ones added in order, de-duplicated on whitespace-collapsed casefolded text, total capped at 12 (a ledger already over 12 keeps all its originals). Kept: title, failure_mechanism, what_happened, the_rule (curated text), `learned_by`/`source` (original provenance). Kept, filled only if blank: severity, occurred_on. Appended: the new source to `incidents.sources` (JSON list; deduplicated on source+learned_by; old rows read as one source). The model's text that was NOT applied is stored in the history row's `proposal`. Why: the ledger is what every later scan is judged against, a model's rephrase of a curated mechanism can move the incident in embedding space and silently change recall, and nothing is lost because the proposal is kept. Defaults I chose beyond the brief: `what_happened` is kept too (it describes the first case, and the second case's text is in `proposal`); `omen seed` still REPLACES (the curated path), writing a history row only if something changed. **History:** table `incident_history(ref, version, ts, action, snapshot JSON, source, proposal)`; actions create/update/forget/**revert** (revert added so an undo is itself undoable); snapshot = full state after the action (for forget: state when forgotten). Incidents written before v3 get a baseline version 1 (stamped with `created_at`) before their first change. **`memory forget` keeps history** (so forgetting is undoable); nothing deletes history. `memory revert <ref>` restores the previous version, or a forgotten incident's state, under the same ref (refs are never reused); `--to N` picks a version; the incident is re-indexed; if Ollama is down the ledger is restored and the message points at `omen doctor --fix`. **Index (B26):** `vectors.reindex_incident` embeds first, then deletes by `incident_ref` and upserts; `omen reindex` stays the full rebuild. Strong test: after seed, write new, merge ×2, forget, revert forgotten, revert merge, merge, forget, the Chroma ids, documents, metadata and vectors equal a full reindex (checked after every step; a mutant that skips the delete is caught). **Doctor:** ledger vs index (missing/stale/extra by variant id and text), Ollama reachability and both models, schema version, ledger size; exit 0 clean / 1 problems; `--fix` = full reindex when drifted; read-only, creates nothing. **Schema v3:** `incident_history`, `incidents.sources`, `findings.stopped_reason` (NULL before). v2→v3 upgrade with data, and a failing v3 rolled back, both tested. **CI:** `PYTHONUTF8` removed from the Windows job (Linux keeps it). Real-embedder check outside pytest (no generation): seed 6 → merge into OMEN-001 → new incident OMEN-007: merge 2.6 s vs full reindex 4.5 s, doctor clean, same 34 ids, min cosine(incremental, full) 1.0, so the incremental path is verified against the real embedding model, though not yet driven by the real LLM (see the Archivist failures). **Incident:** my first doctor tests called `vectors.reindex` before `--store` was applied and emptied the REAL Chroma index in `./omen_store` (the SQLite ledger was untouched); repaired with `omen doctor --fix` (30/30), and `tests/conftest.py` now points every test's default store at a temp dir (autouse). Phase 3 row: already present from the Phase 3 commit, not duplicated. |
 | 2026-11-12 | 4 (CI) | GitHub Actions run **43217245500** on `production-hardening` (commit `e7770b8`): **green on both OSes**. ubuntu-latest and windows-latest, Python 3.11: `ruff check .` clean; **230 passed, 26 deselected**; coverage **92%** on both. Windows ran without `PYTHONUTF8` and needed no code fix. | Recorded here because the Phase 4 row was written before CI had finished. The 4 Archivist live tests failed on CPU as B5 part 2 (see the Phase 4 row); fixed in Phase 5. |
 | 2026-11-12 | 5 | `ruff check .` clean; `pytest -m "not live"`: **343 passed, 26 deselected, coverage 95%** (74 s). `omen calibrate` unchanged (4/4 TP, 2/4 HN, 0/4 unrelated at 0.35). `omen doctor` on the real store: OK (schema 4, 30 indexed). Live suite with `OMEN_PROFILE=cpu`, **stopped by the user after 2 h 10 min to save time**: 24 of 26 ran; **23 passed, 1 failed**. Passed: Adjudicator end-to-end (both) and structured (adk, direct), all 4 Archivist tests (the Phase 4 B5 failures), demo-repo scan (confirmed OMEN-001, 1662 s, 4 tool calls, `model_finished`), all 3 fixture tests, the librarian test, 9 of 10 runner tests, `test_search_memory_and_get_incident`. **Failed: `test_run_tooled_produces_a_sensible_transcript[direct]`** (see below). **Not rerun: stopped by the user to save time:** `test_triage.py::test_triage_precision_recall` (was running) and `test_triage_never_flags_unrelated`. Per-test times were not captured (the durations table prints only at the end of a run); the demo scan's 1662 s is from its own summary. | The failure's traceback was lost with the killed run, so its cause is **not confirmed**. Evidence: the same loop passed `test_run_tooled_respects_a_tight_call_cap[direct]` and the adk variant of this test passed, so a broken direct loop is unlikely. The likeliest cause is the `stopped_reason == model_finished` assertion: since B13 a run that hits the 6-call cap reports `call_cap` even when it wrote a summary, and a `think=False` model can over-call tools. A model-turn timeout (`llm_timeout`) is the other candidate. Next live run: the assertion now prints the transcript. Triage tests still need a live run. |
+| 2026-11-12 | 6 | `ruff check .` clean; `pytest -m "not live"`: **373 passed, 30 deselected** (403 total; 30 new unit tests, 4 new live tests). **No live or model test was run** (user override: short on time), and `omen calibrate` was not re-run because the calibration fixtures' content is unchanged (a rename plus a comment; the test `test_calibration_set_is_the_original_twelve` pins the ids). | Built: `fixtures/calibration.yaml` (the 12, moved with `git mv`) and `fixtures/heldout.yaml` (24: 8 true_match, 8 hard_negative, 8 unrelated; different domains; no shared id, symbol, file path or code line with the calibration set; each true match targets a real incident and covers 5 of 6 incidents). **B21 fixed:** the two worked hard negatives in `omen/prompts/triage.txt` (calibration HN1 and HN2 verbatim) were replaced by two examples in neither file (see the Phase 6 prompt change below); `tests/test_evaluation.py` now fails if any fixture symbol or code line appears in any shipped prompt, and a check proves it flags the old prompt. `omen eval [--fixtures-path] [--full] [--retrieval-only] [--runner] [--results-dir]` (`omen/evaluation.py` plus `cli.cmd_eval`): cumulative per-stage confusion counts, precision, recall and per-class survivors; writes `eval/results-<date>.json` (never overwrites; records fixture SHA-256, threshold, runner, profile, models and prompt hashes); `--full` writes each case's code to a temporary repo for the Investigator's tools. Unit-tested end to end with a fake runner and a fake embedder (both runners, retrieval-only, no warm-up when nothing is gated, user errors, empty ledger). New live test `test_live_adjudicator_does_not_confirm_a_hard_negative` (Adjudicator called directly with a hard-negative chunk and a transcript, 2 chunks x 2 runners, marked `slow`): **not run**. `calibrate`, `test_fixtures`, `test_triage` point at `calibration.yaml`. `docs/EVALUATION.md` written with an empty results table. **Not done, on purpose:** the Phase 6 plan item "evidence rules in the Adjudicator prompt" (behaviour-changing; the brief said to leave the other prompts alone; needs before/after numbers on the held-out set), and results "for both runners and both profiles" (need the model). All five pending items are in the list below. |
 
 ### Phase 3 prompt changes (ground rule 3)
 
@@ -328,6 +329,80 @@ Generated prompt text changed in the same phase:
 
 Retrieval inputs (embeddings, prefixes, `incidents.yaml`, `fixtures/`, `triage.txt`) are unchanged;
 `omen calibrate` was re-run anyway and is identical. The Adjudicator live tests were re-run (row above).
+
+### Phase 6 prompt change (ground rule 3)
+
+On purpose, for B21. SHA-256 of the text as loaded (`omen.prompts.sha256`, LF line endings):
+
+| prompt | before | after |
+|---|---|---|
+| `triage.txt` | `3ccfe136ea5138671752a82fa69b07b353a90fb226ba16a0a4b976c6467ae9a6` | `12a45e149ff572de30813909da523be1dc5b78ee9433ec8fd7a11510c1930b88` |
+| `investigator.txt`, `adjudicator.txt` | unchanged | unchanged |
+
+Only the section "Two worked examples of hard negatives" changed. The old examples were calibration HN1 (a `cachetools.TTLCache` thumbnail cache against OMEN-001)
+and HN2 (`connect_with_backoff` against OMEN-002). The new ones target OMEN-003 (a log line that names an API key but writes only an opaque id) and OMEN-004
+(a check-then-act on a local `set`, with no shared state). Neither chunk is in `calibration.yaml` or `heldout.yaml`. The instruction text around the examples, the
+required output, and the "default is NO_MATCH" rules are untouched.
+
+```diff
+@@ -12,26 +12,23 @@ Before you decide MATCH or NO_MATCH, state what this code chunk can concretely d
+ 
+ ## Two worked examples of hard negatives — study these
+ 
+-Example 1. Incident: "An authorization decision is cached with no invalidation path tied to the permission-changing event, so a revoked permission keeps succeeding." Code chunk:
+-    _thumb_cache = cachetools.TTLCache(maxsize=500, ttl=3600)
+-    def get_thumbnail(image_id):
+-        if image_id in _thumb_cache:
+-            return _thumb_cache[image_id]
+-        thumb = render_thumbnail(image_id)
+-        _thumb_cache[image_id] = thumb
+-        return thumb
+-This is a real cache with no invalidation — but it caches a rendered thumbnail, not an authorization decision. There is no permission check anywhere in it, so there is nothing for a permission change to invalidate. Verdict: NO_MATCH. The shared vocabulary ("cache", "no invalidation") is a coincidence of implementation, not a shared mechanism.
+-
+-Example 2. Incident: "Failed requests are retried on a fixed, unjittered interval, so every waiting client retries in the same instant and the resulting spike re-triggers the outage." Code chunk:
+-    def connect_with_backoff(max_attempts=5):
+-        for attempt in range(max_attempts):
+-            try:
+-                return psycopg2.connect(DSN)
+-            except OperationalError:
+-                delay = min(2 ** attempt, 30) + random.uniform(0, 1)
+-                time.sleep(delay)
+-        raise ConnectionError("exhausted retries")
+-This is a retry loop against the same kind of dependency — but it grows the delay exponentially and adds random jitter, which is exactly the fix the incident's rule calls for. Verdict: NO_MATCH. Retrying is not the failure; retrying with no backoff and no jitter is.
++Example 1. Incident: "A sensitive value (password, API key, token, connection string) flows unredacted into a log line, error message, or crash report, where it persists in a system with broader read access than the value itself warrants." Code chunk:
++    def refresh_api_key(key):
++        new_key = issue_key(key.owner_id)
++        logger.info("refreshed api key id=%s owner=%s ttl=%ss", new_key.id, key.owner_id, new_key.ttl)
++        return new_key
++This logs about an API key, and the words "api key" sound like the incident — but it writes only an opaque identifier, an owner id and a lifetime. The secret value itself never reaches the log line, so nothing sensitive persists anywhere readable. Verdict: NO_MATCH. Mentioning a credential is not leaking one.
++
++Example 2. Incident: "Code reads some state, decides an action is safe based on that read, then performs the action in a separate step with no lock or transaction spanning both — so two concurrent callers can both pass the check and both perform the action." Code chunk:
++    def unique_in_order(items):
++        seen = set()
++        result = []
++        for item in items:
++            if item not in seen:
++                seen.add(item)
++                result.append(item)
++        return result
++This is a check followed by an action, but `seen` is a local variable created inside the call and used by one thread of execution. No second caller can ever act between the check and the add, so there is no race. Verdict: NO_MATCH. A check-then-act sequence is only the failure when the state being checked is shared.
+ 
+ ## What you will be shown
+ 
+```
+
+**Effect on the gates is unknown.** Calibration HN1 and HN2 are now unseen by the prompt, so the Triage gate (`test_triage.py`) is a stricter test than before and may report
+different numbers. Pending live verification (Triage gate, calibrate).
+
+### Pending live verification (cumulative)
+
+Nothing in this list has been run since the change that made it necessary. Each item must be run on the GPU machine (or at least a live Ollama) before the branch is merged.
+
+1. `tests/test_runners.py::test_run_tooled_produces_a_sensible_transcript[direct]`: failed in the Phase 5 CPU run; cause unconfirmed, probably the B13 `stopped_reason == model_finished` assertion.
+2. The two `tests/test_triage.py` tests (`test_triage_precision_recall`, `test_triage_never_flags_unrelated`): not run since Phase 0, and now run against the new prompt.
+3. The new Triage prompt from Phase 6 (sha256 `12a45e14...`): Triage gate and `omen calibrate`.
+4. The Adjudicator hard-negative live test, `tests/test_adjudicator.py::test_live_adjudicator_does_not_confirm_a_hard_negative` (4 parametrizations).
+5. `omen eval` on the held-out set (`fixtures/heldout.yaml`), both runners; fills the table in `docs/EVALUATION.md`.
 
 Phase 0 calibration sweep (`python -m omen.cli calibrate`, real `omen_store/`, 2026-11-12):
 

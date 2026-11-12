@@ -1,4 +1,5 @@
-"""Phase 6 acceptance: run the fixture set through Triage and record
+"""Phase 6 acceptance: run the calibration fixtures (fixtures/calibration.yaml,
+the tuning set) through Triage and record
 precision/recall. This doubles as the full-pipeline fixture gate PLAN.md's
 Verification section calls for: "≥3/4 true positives caught, ≤1/4 hard
 negatives flagged. Gates every prompt change — a prompt edit that lifts
