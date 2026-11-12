@@ -12,7 +12,6 @@
 Live Ollama required for the end-to-end test (skips gracefully without
 it); the prompt-independence and downgrade tests are pure and always run.
 """
-import urllib.request
 
 import pytest
 
@@ -26,14 +25,6 @@ from omen.contracts import (
     Transcript,
     TriageVerdict,
 )
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def test_confirmed_with_no_evidence_is_downgraded():
@@ -99,8 +90,6 @@ def test_adjudicator_prompt_is_blind_to_triage(tmp_path):
     assert "Investigator's clean summary." in prompt
 
 
-pytestmark_live = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
-
 TRUE_POSITIVE_CODE = (
     "@functools.lru_cache(maxsize=1024)\n"
     "def has_access(user_id, resource_id):\n"
@@ -117,7 +106,8 @@ HARD_NEGATIVE_CODE = (
 )
 
 
-@pytestmark_live
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "code,symbol,should_confirm",

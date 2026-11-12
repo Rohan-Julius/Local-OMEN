@@ -16,20 +16,11 @@ from __future__ import annotations
 
 import argparse
 import socket
-import urllib.request
 
 import pytest
 
 from omen import agents, cli, config, store, vectors
 from omen.contracts import TriageVerdict
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def test_adk_agent_construction_touches_no_socket(monkeypatch):
@@ -54,9 +45,6 @@ def test_adk_agent_construction_touches_no_socket(monkeypatch):
     assert agent.name == "structured_role"
 
 
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
-
-
 @pytest.fixture
 def isolated_store(tmp_path, monkeypatch):
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
@@ -67,6 +55,7 @@ def isolated_store(tmp_path, monkeypatch):
     return conn
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_scan_against_empty_ledger_gates_nothing_without_crashing(tmp_path, isolated_store):
     repo = tmp_path / "repo"

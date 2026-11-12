@@ -11,7 +11,6 @@ real `incidents.yaml` (never the live on-disk ledger/Chroma index).
 """
 import argparse
 import subprocess
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -22,14 +21,6 @@ DEMO_REPO = Path(__file__).resolve().parent.parent / "demo_repo"
 INCIDENTS_YAML = Path(__file__).resolve().parent.parent / "incidents.yaml"
 
 
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
 def test_no_redis_anywhere_in_demo_repo():
     """PLAN.md: "grep -ri redis demo_repo/ returns nothing" — the true
     positive shares OMEN-001's mechanism with no shared vocabulary."""
@@ -37,9 +28,6 @@ def test_no_redis_anywhere_in_demo_repo():
         ["grep", "-ril", "redis", str(DEMO_REPO)], capture_output=True, text=True
     )
     assert result.stdout.strip() == "", f"unexpected Redis mention(s): {result.stdout}"
-
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
 
 
 @pytest.fixture
@@ -61,6 +49,8 @@ def _scan_args() -> argparse.Namespace:
     )
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_scan_confirms_permissions_and_rejects_response_cache(isolated_store):
     await cli.cmd_scan(_scan_args())

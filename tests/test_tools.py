@@ -5,20 +5,11 @@ need Ollama, and those skip gracefully without it.
 """
 import subprocess
 import time
-import urllib.request
 
 import pytest
 
 from omen import config, store, tools, vectors
 from omen.tools import PathEscapesRoot, ToolBudget
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def _git(repo, *args) -> None:
@@ -218,7 +209,7 @@ def test_write_incident_updates_when_given_existing_ref(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
+@pytest.mark.live
 def test_search_memory_and_get_incident(tmp_path, monkeypatch):
     from omen.contracts import Incident
 

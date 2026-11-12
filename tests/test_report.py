@@ -14,20 +14,11 @@ gracefully without it.
 """
 import argparse
 import time
-import urllib.request
 
 import pytest
 
 from omen import cli, config, report, runners, store, tools as tools_mod, vectors
 from omen.contracts import AdjudicatorVerdict, Finding, IncidentSeed, Transcript, TriageVerdict
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +82,6 @@ def test_print_summary_handles_no_findings(capsys):
 # ---------------------------------------------------------------------------
 
 
-pytestmark = pytest.mark.skipif(
-    not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST (needed for the embed step)"
-)
-
-
 class _FakeRunner:
     """Stands in for ADKRoleRunner/DirectOllamaRunner so this test proves
     the Scribe's persistence plumbing, not prompt quality (covered live
@@ -130,6 +116,7 @@ def _scan_args(path: str) -> argparse.Namespace:
     return argparse.Namespace(path=path, since=None, all=False, dry_run=False, retrieval_only=False, runner="adk")
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_cmd_scan_persists_run_findings_and_tool_calls(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
@@ -185,6 +172,7 @@ async def test_cmd_scan_persists_run_findings_and_tool_calls(tmp_path, monkeypat
     assert tool_calls[0]["ms"] is not None
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_cmd_scan_retrieval_only_does_not_persist_a_run(tmp_path, monkeypatch):
     repo = tmp_path / "repo"

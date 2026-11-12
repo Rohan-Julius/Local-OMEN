@@ -4,21 +4,12 @@ the top 3, and a second run hits the embed cache 100%. Pure-logic pieces
 pipeline test needs a live Ollama and is skipped gracefully if one isn't
 reachable.
 """
-import urllib.request
 
 import pytest
 
 from omen import librarian, store, vectors
 from omen.config import OLLAMA_HOST
 from omen.contracts import Chunk, Incident
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def _hit(ref: str, similarity: float, variant: str) -> dict:
@@ -145,7 +136,7 @@ def test_embed_chunks_dedups_identical_content_within_one_call(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
+@pytest.mark.live
 def test_known_positive_chunk_retrieves_its_incident_in_top_3(tmp_path, monkeypatch):
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
 

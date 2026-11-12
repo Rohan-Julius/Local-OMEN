@@ -9,23 +9,11 @@ file in the suite that's genuinely slow (12 fixtures x one Triage call
 each), because there is no meaningful way to test prompt quality without
 actually running the model.
 """
-import urllib.request
 
 import pytest
 
 from omen import agents, config, fixtures as fixtures_mod, librarian, runners, store, vectors
 from omen.contracts import TriageVerdict
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
 
 
 def _format_prompt(chunk, candidates, conn) -> str:
@@ -46,10 +34,10 @@ def _format_prompt(chunk, candidates, conn) -> str:
 
 
 @pytest.fixture(scope="module")
-def triage_results():
-    conn = store.connect()
-    if vectors.count() == 0:
-        pytest.skip("Chroma index is empty — run `omen seed incidents.yaml` and `omen reindex` first")
+def triage_results(seeded_store):
+    # A temporary ledger seeded from incidents.yaml (conftest.py), not the
+    # local omen_store/ (audit B20).
+    conn = seeded_store
 
     cases = fixtures_mod.load_fixtures()
     chunks = [fixtures_mod.fixture_to_chunk(c) for c in cases]
@@ -80,6 +68,8 @@ def triage_results():
     return asyncio.run(run_all())
 
 
+@pytest.mark.live
+@pytest.mark.slow
 def test_triage_precision_recall(triage_results):
     true_matches = [(c, v) for c, v in triage_results if c.label == "true_match"]
     hard_negatives = [(c, v) for c, v in triage_results if c.label == "hard_negative"]
@@ -99,6 +89,8 @@ def test_triage_precision_recall(triage_results):
     assert len(hn_flagged) <= 1, f"{hn_flagged} flagged — above the ≤1/4 hard-negative precision bar"
 
 
+@pytest.mark.live
+@pytest.mark.slow
 def test_triage_never_flags_unrelated(triage_results):
     """Not a formal PLAN.md bar, but a chunk with zero relation to any
     incident mechanism flagging MATCH would be a much worse failure than
