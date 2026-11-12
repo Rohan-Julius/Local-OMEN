@@ -66,10 +66,36 @@ def _on_step_printer():
     return on_step
 
 
+def _postmortem_root(args: argparse.Namespace) -> tuple[Path, str] | None:
+    """The directory the Archivist's read_file is confined to, and the
+    postmortem's path relative to it. Default: the postmortem's own
+    directory, never the cwd. The cwd is normally the Omen project root,
+    which holds `.env` and `omen_store/` (audit B4). `--allow-dir` widens
+    the root to a directory that must contain the postmortem."""
+    postmortem = Path(args.postmortem_path).resolve()
+    allow_dir = getattr(args, "allow_dir", None)
+    root = Path(allow_dir).resolve() if allow_dir else postmortem.parent
+    try:
+        rel = postmortem.relative_to(root)
+    except ValueError:
+        print(f"error: {args.postmortem_path} is not inside --allow-dir {allow_dir}")
+        return None
+    return root, rel.as_posix()
+
+
 async def _cmd_learn_postmortem(args: argparse.Namespace, conn, runner) -> None:
+    confined = _postmortem_root(args)
+    if confined is None:
+        return
+    root, rel_path = confined
     print(f"[archivist] reading {args.postmortem_path}...")
     transcript = await archivist.learn_from_postmortem(
-        runner, conn, Path.cwd(), args.postmortem_path, on_step=_on_step_printer()
+        runner,
+        conn,
+        root,
+        rel_path,
+        on_step=_on_step_printer(),
+        source=f"postmortem:{args.postmortem_path}",
     )
     print(f"[archivist] stopped_reason={transcript.stopped_reason}  {len(transcript.steps)} tool call(s)")
     print(f"[archivist] summary: {transcript.final_text}")
@@ -464,6 +490,13 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="Path to a postmortem document, relative to the current directory",
+    )
+    p_learn.add_argument(
+        "--allow-dir",
+        default=None,
+        help="With a postmortem path, the directory the Archivist may read from "
+        "(default: the postmortem's own directory). Secrets, databases, omen_store/ "
+        "and .git/ are always refused.",
     )
     p_learn.add_argument(
         "--from-git",

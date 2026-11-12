@@ -87,6 +87,74 @@ def test_git_diff_skips_deleted_files(tmp_path):
     assert result.files == []
 
 
+def _repo_with_subdir(tmp_path: Path) -> Path:
+    _init_repo(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "a.py").write_text("def f():\n    return 1\n")
+    (sub / "b.py").write_text("def g():\n    return 2\n")
+    (tmp_path / "top.py").write_text("def t():\n    return 0\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "initial")
+    return sub
+
+
+def test_b1_diff_scope_on_a_subdirectory_finds_its_changed_files(tmp_path):
+    """B1: git prints root-relative paths, so scanning `sub/` used to look
+    for `sub/sub/a.py` and find nothing. Changes outside `sub/` must not
+    leak into the scope either."""
+    sub = _repo_with_subdir(tmp_path)
+    (sub / "a.py").write_text("def f():\n    return 10\n")
+    (tmp_path / "top.py").write_text("def t():\n    return 99\n")
+
+    result = scout.resolve_scope(sub)
+    assert result.files == [sub / "a.py"]
+
+
+def test_b1_since_scope_on_a_subdirectory_finds_its_changed_files(tmp_path):
+    sub = _repo_with_subdir(tmp_path)
+    (sub / "b.py").write_text("def g():\n    return 20\n")
+    (tmp_path / "top.py").write_text("def t():\n    return 99\n")
+    _git(tmp_path, "commit", "-qam", "second")
+
+    result = scout.resolve_scope(sub, since="HEAD~1")
+    assert result.files == [sub / "b.py"]
+
+
+def test_b2_default_scope_includes_staged_and_untracked_files_once(tmp_path):
+    """B2: the default scope used to be `git diff` alone (working tree vs
+    index), which misses staged changes and brand-new files."""
+    _init_repo(tmp_path)
+    for name in ("unstaged.py", "staged.py", "both.py", "clean.py"):
+        (tmp_path / name).write_text("def f():\n    return 1\n")
+    (tmp_path / ".gitignore").write_text("ignored.py\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "initial")
+
+    (tmp_path / "unstaged.py").write_text("def f():\n    return 2\n")
+    (tmp_path / "staged.py").write_text("def f():\n    return 2\n")
+    _git(tmp_path, "add", "staged.py")
+    (tmp_path / "both.py").write_text("def f():\n    return 2\n")
+    _git(tmp_path, "add", "both.py")
+    (tmp_path / "both.py").write_text("def f():\n    return 3\n")  # staged AND unstaged change
+    (tmp_path / "new.py").write_text("def f():\n    return 1\n")  # untracked
+    (tmp_path / "ignored.py").write_text("def f():\n    return 1\n")  # untracked but ignored
+
+    result = scout.resolve_scope(tmp_path)
+    assert result.scope == "diff"
+    assert result.files == sorted(tmp_path / n for n in ("both.py", "new.py", "staged.py", "unstaged.py"))
+
+
+def test_b2_default_scope_works_before_the_first_commit(tmp_path):
+    _init_repo(tmp_path)
+    (tmp_path / "staged.py").write_text("def f():\n    return 1\n")
+    _git(tmp_path, "add", "staged.py")
+    (tmp_path / "new.py").write_text("def g():\n    return 1\n")
+
+    result = scout.resolve_scope(tmp_path)
+    assert result.files == [tmp_path / "new.py", tmp_path / "staged.py"]
+
+
 # ---------------------------------------------------------------------------
 # ast chunking
 # ---------------------------------------------------------------------------

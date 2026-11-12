@@ -36,14 +36,19 @@ async def learn_from_postmortem(
     think: bool = ARCHIVIST_THINK_DEFAULT,
     on_step: Callable | None = None,
     on_text: Callable[[str], None] | None = None,
+    source: str | None = None,
 ) -> Transcript:
     """Drive one Archivist invocation over one postmortem document. Returns
     the tool-call transcript; the caller inspects it for a `write_incident`
     step to learn the assigned ref (PLAN.md: `write_incident` "Returns the
-    assigned ref.")."""
+    assigned ref.").
+
+    `postmortem_path` is relative to `allowed_root` (it is what the model
+    passes to read_file). `source` is the provenance recorded on the
+    incident; it defaults to `postmortem:<postmortem_path>`."""
     instruction = agents.load_prompt("archivist_postmortem.txt")
     learn_tools = tools_mod.build_learn_postmortem_tools(
-        conn, allowed_root, source=f"postmortem:{postmortem_path}"
+        conn, allowed_root, source=source or f"postmortem:{postmortem_path}"
     )
     budget = ToolBudget()
     prompt = _build_postmortem_prompt(postmortem_path)
@@ -82,10 +87,12 @@ async def learn_from_commit(
 
 
 def written_ref(transcript: Transcript) -> str | None:
-    """The ref assigned by the last successful (non-capped, non-duplicate)
-    `write_incident` call in a transcript, or None if the Archivist never
-    wrote one."""
+    """The ref assigned by the last successful (non-capped, non-duplicate,
+    non-error) `write_incident` call in a transcript, or None if the
+    Archivist never wrote one. A step whose tool raised carries
+    `note="error"` (audit B10); the ref-format check is a second guard so
+    that error text is never reported as a ref."""
     for step in reversed(transcript.steps):
-        if step.tool_name == "write_incident" and step.note is None:
+        if step.tool_name == "write_incident" and step.note is None and tools_mod.is_ref(step.result):
             return step.result
     return None

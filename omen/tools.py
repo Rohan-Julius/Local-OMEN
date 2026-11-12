@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from omen import librarian, scout, store, vectors
-from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, TOOL_WALL_CLOCK_SECONDS
+from omen.config import DIFF_LINE_CAP, GREP_MAX_HITS, MAX_TOOL_CALLS, REF_PREFIX, STORE_DIR, TOOL_WALL_CLOCK_SECONDS
 from omen.contracts import IncidentSeed, ToolCallStep
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,36 @@ class PathEscapesRoot(Exception):
     not write) and choosing its own paths; a traversal escape would let a
     crafted repo read arbitrary files on the host. Cheap to prevent, so
     prevent it here rather than trust every call site to remember."""
+
+
+class PathDenied(Exception):
+    """Raised when a tool-supplied path is inside its confined root but
+    names something an agent must never read: secrets (`.env`), a SQLite
+    database, Omen's own store, or git internals (audit B4)."""
+
+
+DENIED_DIR_NAMES = {".git", "omen_store"}
+DENIED_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+
+
+def deny_sensitive(root: Path, resolved: Path) -> None:
+    """Refuse paths an agent reading attacker-adjacent content must not
+    see, even when they sit inside its confined root. `resolved` must
+    already have passed `confine(root, ...)`."""
+    rel = resolved.relative_to(Path(root).resolve())
+    name = resolved.name.lower()
+    if (
+        any(part.lower() in DENIED_DIR_NAMES for part in rel.parts)
+        or name == ".env"
+        or name.startswith(".env.")
+        or resolved.suffix.lower() in DENIED_SUFFIXES
+    ):
+        raise PathDenied(f"{str(rel)!r} is a protected path (secrets, databases, omen_store/, .git/) and cannot be read")
+    try:
+        resolved.relative_to(STORE_DIR.resolve())
+    except ValueError:
+        return
+    raise PathDenied(f"{str(rel)!r} is inside Omen's store and cannot be read")
 
 
 def confine(root: Path, relative_path: str) -> Path:
@@ -168,12 +198,33 @@ def _make_read_file(allowed_root: Path) -> Callable:
             file_path: Path to the document, relative to the project root.
         """
         resolved = confine(allowed_root, file_path)
+        deny_sensitive(allowed_root, resolved)
         try:
             return resolved.read_text(encoding="utf-8")
         except OSError as e:
             return f"error reading {file_path}: {e}"
 
     return read_file
+
+
+def _resolve_commit(repo_root: Path, sha: str) -> tuple[str | None, str | None]:
+    """Resolve a model-supplied commit name to a full 40-hex SHA, or return
+    (None, error). The model chooses `sha`, so it is attacker-adjacent
+    input: passed to `git show` as-is, `--output=<path>` is parsed as an
+    option and writes a file on the host (audit B3). A leading `-` is
+    refused outright, `--end-of-options` stops git from reading the value
+    as an option, and only the resolved hex SHA is ever passed on."""
+    if not isinstance(sha, str) or not sha.strip() or sha.lstrip().startswith("-"):
+        return None, f"error: {sha!r} is not a commit SHA"
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha.strip()}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    resolved = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+        return None, f"error: could not read commit {sha}: not a commit in this repository"
+    return resolved, None
 
 
 def _make_read_commit(repo_root: Path) -> Callable:
@@ -183,8 +234,14 @@ def _make_read_commit(repo_root: Path) -> Callable:
         Args:
             sha: The commit SHA (full or abbreviated).
         """
+        resolved, error = _resolve_commit(repo_root, sha)
+        if error:
+            return error
         result = subprocess.run(
-            ["git", "-C", str(repo_root), "show", "--stat", "--format=%H%n%an <%ae>%n%ad%n%s%n%n%b", sha],
+            [
+                "git", "-C", str(repo_root), "show", "--stat",
+                "--format=%H%n%an <%ae>%n%ad%n%s%n%n%b", "--end-of-options", resolved,
+            ],
             capture_output=True,
             text=True,
         )
@@ -206,9 +263,13 @@ def _make_read_diff(repo_root: Path) -> Callable:
         # No confine() here: git resolves file_path against its own object
         # database for that commit, not the host filesystem, so a
         # traversal attempt just fails to match a tracked path rather
-        # than reading anything outside the repo.
+        # than reading anything outside the repo. `--` keeps file_path a
+        # pathspec; `sha` is resolved and option-guarded first (B3).
+        resolved, error = _resolve_commit(repo_root, sha)
+        if error:
+            return error
         result = subprocess.run(
-            ["git", "-C", str(repo_root), "show", sha, "--", file_path],
+            ["git", "-C", str(repo_root), "show", "--end-of-options", resolved, "--", file_path],
             capture_output=True,
             text=True,
         )
@@ -222,12 +283,20 @@ def _make_read_diff(repo_root: Path) -> Callable:
     return read_diff
 
 
+def is_ref(value: object) -> bool:
+    """True for a well-formed incident ref, e.g. 'OMEN-001'."""
+    return isinstance(value, str) and store.ref_number(value) is not None
+
+
 def _next_ref(conn: sqlite3.Connection) -> str:
-    max_n = 0
+    """One past the highest ref number ever used, counting forgotten refs
+    (store's high-water mark), so a forgotten ref is never reassigned to a
+    different incident (audit B11)."""
+    max_n = store.ref_high_water(conn)
     for incident in store.list_incidents(conn):
-        m = re.match(rf"{re.escape(REF_PREFIX)}-(\d+)$", incident.ref)
-        if m:
-            max_n = max(max_n, int(m.group(1)))
+        n = store.ref_number(incident.ref)
+        if n is not None:
+            max_n = max(max_n, n)
     return f"{REF_PREFIX}-{max_n + 1:03d}"
 
 
@@ -252,6 +321,23 @@ def _make_write_incident(conn: sqlite3.Connection, learned_by: str, source: str)
             severity: Severity if known, e.g. 'sev1', 'sev2', 'sev3'. Empty string if unknown.
             existing_ref: If updating a near-duplicate found via search_memory, its ref (e.g. 'OMEN-003'). Empty string to create a new incident.
         """
+        # The model chooses existing_ref. Before this check any string
+        # became a ref, including malformed ones and refs that do not
+        # exist (audit B9). Raising (not returning an error string) lets
+        # ToolBudget mark the step note="error", so it is never reported
+        # as a written ref (B10).
+        existing_ref = (existing_ref or "").strip()
+        if existing_ref:
+            if not is_ref(existing_ref):
+                raise ValueError(
+                    f"existing_ref {existing_ref!r} is not a valid ref (expected e.g. '{REF_PREFIX}-001'); "
+                    "pass an empty string to create a new incident"
+                )
+            if store.get_incident(conn, existing_ref) is None:
+                raise ValueError(
+                    f"existing_ref {existing_ref!r} is not in memory; use a ref returned by search_memory, "
+                    "or pass an empty string to create a new incident"
+                )
         ref = existing_ref or _next_ref(conn)
         seed = IncidentSeed(
             ref=ref,
@@ -298,16 +384,27 @@ class ToolBudget:
     investigation: a max total call count, a duplicate-call cache (a
     repeat of the same tool+args is answered from cache with a note
     instead of re-executing), and a wall-clock ceiling. All three checked
-    here, never left to a prompt asking the model to behave."""
+    here, never left to a prompt asking the model to behave.
+
+    The wall clock starts at the first tool call, not at construction.
+    Starting it at construction counted the first model turn too, and on
+    slow (CPU) hardware that turn alone used up the whole budget, so the
+    first tool call was refused (audit B5). Generation time before the
+    first call needs its own timeout (production plan, Phase 5).
+    `wall_clock_seconds` and `max_calls` are constructor arguments with
+    the config.py values as defaults."""
 
     def __init__(self, max_calls: int = MAX_TOOL_CALLS, wall_clock_seconds: float = TOOL_WALL_CLOCK_SECONDS):
         self.max_calls = max_calls
         self.wall_clock_seconds = wall_clock_seconds
-        self._start = time.monotonic()
+        self._start: float | None = None
         self._count = 0
         self._cache: dict[tuple, object] = {}
 
     def elapsed_seconds(self) -> float:
+        """Seconds since the first tool call; 0.0 before any call."""
+        if self._start is None:
+            return 0.0
         return time.monotonic() - self._start
 
     @staticmethod
@@ -323,7 +420,11 @@ class ToolBudget:
         """Returns (ok, result, note). `ok=False` means the tool did not
         run (a cap tripped); `note` is non-None for anything the caller
         should feed back to the model (a cap message or a duplicate-call
-        notice)."""
+        notice). A tool that raised returns ok=True with an "error: ..."
+        result and `note="error"`, so callers (e.g. `archivist.written_ref`)
+        never mistake the error text for a real result (audit B10)."""
+        if self._start is None:
+            self._start = time.monotonic()
         if self.elapsed_seconds() > self.wall_clock_seconds:
             return False, None, "wall-clock ceiling exceeded - stop calling tools and answer now"
         if self._count >= self.max_calls:
@@ -338,15 +439,16 @@ class ToolBudget:
         if tool_name not in tools:
             return False, None, f"unknown tool {tool_name!r}"
 
+        note = None
         try:
             result = tools[tool_name](**kwargs)
-        except PathEscapesRoot as e:
-            result = f"error: {e}"
+        except (PathEscapesRoot, PathDenied) as e:
+            result, note = f"error: {e}", "error"
         except Exception as e:
-            result = f"error: {type(e).__name__}: {e}"
+            result, note = f"error: {type(e).__name__}: {e}", "error"
 
         self._cache[key] = result
-        return True, result, None
+        return True, result, note
 
 
 def _stringify(result: object) -> str:

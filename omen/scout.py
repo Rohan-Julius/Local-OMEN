@@ -60,13 +60,9 @@ def _git_tracked_py_files(repo_path: Path) -> list[Path]:
     return files
 
 
-def _git_diff_py_files(repo_path: Path, since: str | None) -> list[Path]:
-    args = ["diff", "--name-only"]
-    if since:
-        args.append(since)
-    result = _run_git(repo_path, args)
+def _existing_py_files(repo_path: Path, git_output: str) -> list[Path]:
     files = []
-    for line in result.stdout.splitlines():
+    for line in git_output.splitlines():
         if line.endswith(".py"):
             candidate = repo_path / line
             if candidate.exists():  # diff can list deleted files
@@ -74,11 +70,43 @@ def _git_diff_py_files(repo_path: Path, since: str | None) -> list[Path]:
     return files
 
 
+def _git_diff_py_files(repo_path: Path, since: str | None) -> list[Path]:
+    """`--relative`, run from `repo_path` (git -C), limits the diff to that
+    directory and prints paths relative to it. Without it git prints
+    repo-root-relative paths, and scanning a subdirectory found nothing
+    (audit B1)."""
+    args = ["diff", "--name-only", "--relative"]
+    if since:
+        args += ["--end-of-options", since]
+    return _existing_py_files(repo_path, _run_git(repo_path, args).stdout)
+
+
+def _git_working_changes_py_files(repo_path: Path) -> list[Path]:
+    """Default scope: everything not yet committed. That is unstaged
+    changes (`git diff`), staged changes (`git diff --cached`) and new
+    untracked files that are not ignored (`git ls-files --others
+    --exclude-standard`), de-duplicated and sorted. `git diff` alone
+    missed the last two (audit B2). `--cached` also works before the first
+    commit. `ls-files` run from a subdirectory already prints paths
+    relative to it."""
+    outputs = [
+        _run_git(repo_path, ["diff", "--name-only", "--relative"]).stdout,
+        _run_git(repo_path, ["diff", "--name-only", "--relative", "--cached"]).stdout,
+        _run_git(repo_path, ["ls-files", "--others", "--exclude-standard"]).stdout,
+    ]
+    seen: set[Path] = set()
+    for output in outputs:
+        seen.update(_existing_py_files(repo_path, output))
+    return sorted(seen)
+
+
 def resolve_scope(repo_path: Path, since: str | None = None, all_files: bool = False) -> ScopeResult:
     """Resolve which files to scan.
 
-    Default: `git diff --name-only` (uncommitted changes). `--since <rev>`
-    diffs against a specific ref. `--all` walks the whole tracked tree.
+    Default: every uncommitted change, i.e. unstaged, staged and untracked
+    (not ignored) files. `--since <rev>` diffs the working tree against a
+    specific ref. Both are limited to `repo_path` when it is a
+    subdirectory of a repo. `--all` walks the whole tracked tree.
     A path that isn't a git repo falls back to a full filesystem walk, with
     a printed notice — platform-agnostic, per PLAN.md's decision to keep
     scope resolution local-git-only rather than depend on a host API.
@@ -95,7 +123,7 @@ def resolve_scope(repo_path: Path, since: str | None = None, all_files: bool = F
     if since:
         return ScopeResult(files=_git_diff_py_files(repo_path, since), scope=f"since:{since}")
 
-    return ScopeResult(files=_git_diff_py_files(repo_path, None), scope="diff")
+    return ScopeResult(files=_git_working_changes_py_files(repo_path), scope="diff")
 
 
 # ---------------------------------------------------------------------------

@@ -5,12 +5,13 @@ around.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
 import yaml
 
-from omen.config import DB_PATH
+from omen.config import DB_PATH, REF_PREFIX
 from omen.contracts import Incident, IncidentSeed, RunRecord, ToolCallRecord
 
 SCHEMA = """
@@ -70,7 +71,16 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   chunk_symbol TEXT, seq INTEGER,
   tool_name TEXT NOT NULL, args_json TEXT, result_summary TEXT, ms INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
+
+# meta key: the highest incident ref number ever inserted or forgotten, so
+# a forgotten ref is never handed out again (audit B11).
+REF_HIGH_WATER_KEY = "ref_high_water"
 
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -108,6 +118,29 @@ def _row_to_incident(conn: sqlite3.Connection, row: sqlite3.Row) -> Incident:
     )
 
 
+def ref_number(ref: str) -> int | None:
+    """The numeric part of a well-formed ref (`OMEN-012` -> 12), else None."""
+    m = re.fullmatch(rf"{re.escape(REF_PREFIX)}-(\d{{3,}})", ref)
+    return int(m.group(1)) if m else None
+
+
+def ref_high_water(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (REF_HIGH_WATER_KEY,)).fetchone()
+    return int(row["value"]) if row else 0
+
+
+def _bump_ref_high_water(conn: sqlite3.Connection, ref: str) -> None:
+    """Record `ref` as used. Called on insert and on forget, so the mark
+    also covers refs that existed before this table did (seeded or learned
+    by an older version) once they are forgotten. Caller commits."""
+    n = ref_number(ref)
+    if n is not None and n > ref_high_water(conn):
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (REF_HIGH_WATER_KEY, str(n)),
+        )
+
+
 def upsert_incident(conn: sqlite3.Connection, seed: IncidentSeed) -> Incident:
     """Insert a new incident or, if `ref` already exists, update it in
     place and replace its surface forms. Used by both `omen seed` and the
@@ -126,6 +159,7 @@ def upsert_incident(conn: sqlite3.Connection, seed: IncidentSeed) -> Incident:
             ),
         )
         incident_id = cur.lastrowid
+        _bump_ref_high_water(conn, seed.ref)
     else:
         incident_id = existing["id"]
         conn.execute(
@@ -168,8 +202,11 @@ def get_incident(conn: sqlite3.Connection, ref: str) -> Incident | None:
 
 def forget_incident(conn: sqlite3.Connection, ref: str) -> bool:
     """Delete an incident and its surface forms (cascades via FK). This is
-    the undo for autonomous memory writes (PLAN.md: "omen memory forget")."""
+    the undo for autonomous memory writes (PLAN.md: "omen memory forget").
+    The ref's number is retired, never reassigned (audit B11)."""
     cur = conn.execute("DELETE FROM incidents WHERE ref = ?", (ref,))
+    if cur.rowcount > 0:
+        _bump_ref_high_water(conn, ref)
     conn.commit()
     return cur.rowcount > 0
 
