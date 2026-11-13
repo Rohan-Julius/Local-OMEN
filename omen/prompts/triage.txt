@@ -12,26 +12,23 @@ Before you decide MATCH or NO_MATCH, state what this code chunk can concretely d
 
 ## Two worked examples of hard negatives — study these
 
-Example 1. Incident: "An authorization decision is cached with no invalidation path tied to the permission-changing event, so a revoked permission keeps succeeding." Code chunk:
-    _thumb_cache = cachetools.TTLCache(maxsize=500, ttl=3600)
-    def get_thumbnail(image_id):
-        if image_id in _thumb_cache:
-            return _thumb_cache[image_id]
-        thumb = render_thumbnail(image_id)
-        _thumb_cache[image_id] = thumb
-        return thumb
-This is a real cache with no invalidation — but it caches a rendered thumbnail, not an authorization decision. There is no permission check anywhere in it, so there is nothing for a permission change to invalidate. Verdict: NO_MATCH. The shared vocabulary ("cache", "no invalidation") is a coincidence of implementation, not a shared mechanism.
+Example 1. Incident: "A sensitive value (password, API key, token, connection string) flows unredacted into a log line, error message, or crash report, where it persists in a system with broader read access than the value itself warrants." Code chunk:
+    def refresh_api_key(key):
+        new_key = issue_key(key.owner_id)
+        logger.info("refreshed api key id=%s owner=%s ttl=%ss", new_key.id, key.owner_id, new_key.ttl)
+        return new_key
+This logs about an API key, and the words "api key" sound like the incident — but it writes only an opaque identifier, an owner id and a lifetime. The secret value itself never reaches the log line, so nothing sensitive persists anywhere readable. Verdict: NO_MATCH. Mentioning a credential is not leaking one.
 
-Example 2. Incident: "Failed requests are retried on a fixed, unjittered interval, so every waiting client retries in the same instant and the resulting spike re-triggers the outage." Code chunk:
-    def connect_with_backoff(max_attempts=5):
-        for attempt in range(max_attempts):
-            try:
-                return psycopg2.connect(DSN)
-            except OperationalError:
-                delay = min(2 ** attempt, 30) + random.uniform(0, 1)
-                time.sleep(delay)
-        raise ConnectionError("exhausted retries")
-This is a retry loop against the same kind of dependency — but it grows the delay exponentially and adds random jitter, which is exactly the fix the incident's rule calls for. Verdict: NO_MATCH. Retrying is not the failure; retrying with no backoff and no jitter is.
+Example 2. Incident: "Code reads some state, decides an action is safe based on that read, then performs the action in a separate step with no lock or transaction spanning both — so two concurrent callers can both pass the check and both perform the action." Code chunk:
+    def unique_in_order(items):
+        seen = set()
+        result = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+This is a check followed by an action, but `seen` is a local variable created inside the call and used by one thread of execution. No second caller can ever act between the check and the add, so there is no race. Verdict: NO_MATCH. A check-then-act sequence is only the failure when the state being checked is shared.
 
 ## What you will be shown
 

@@ -1,5 +1,6 @@
-"""Loader for fixtures/fixtures.yaml — the Phase 4 calibration set and
-ongoing regression gate. Shared by `omen calibrate` (the threshold sweep)
+"""Loader for the labeled fixture files: fixtures/calibration.yaml (the
+Phase 4 tuning set and retrieval regression gate) and fixtures/heldout.yaml
+(the evaluation set, never used for tuning; production plan Phase 6). Shared by `omen calibrate` (the threshold sweep)
 and tests/test_fixtures.py (the pinned acceptance check), so the two
 never drift apart on how a fixture becomes a Chunk.
 """
@@ -12,7 +13,10 @@ import yaml
 
 from omen.contracts import Chunk, FixtureCase
 
-DEFAULT_FIXTURES_PATH = Path("fixtures") / "fixtures.yaml"
+# Tuning set: `omen calibrate`, test_fixtures.py, test_triage.py.
+DEFAULT_FIXTURES_PATH = Path("fixtures") / "calibration.yaml"
+# Evaluation set: `omen eval`. Never used to choose a threshold or edit a prompt.
+DEFAULT_HELDOUT_PATH = Path("fixtures") / "heldout.yaml"
 
 
 def load_fixtures(path: Path = DEFAULT_FIXTURES_PATH) -> list[FixtureCase]:

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
+from pathlib import Path
 
 # Belt and braces (PLAN.md): Settings(anonymized_telemetry=False) below is
 # the primary switch, but Chroma also reads this env var directly in a few
@@ -19,13 +21,20 @@ import urllib.request
 # telemetry module is imported, so this sits above the `import chromadb`.
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
-import chromadb
-from chromadb.config import Settings
+import chromadb  # noqa: E402 - must follow the telemetry env var above
+from chromadb.config import Settings  # noqa: E402
 
-from omen.config import CHROMA_COLLECTION, CHROMA_PATH, EMBED_MODEL, OLLAMA_HOST
-from omen.contracts import Incident
+from omen import config, errors  # noqa: E402
+from omen.config import CHROMA_COLLECTION, EMBED_MODEL  # noqa: E402
+from omen.contracts import Incident  # noqa: E402
 
-_EMBED_URL = f"{OLLAMA_HOST}/api/embed"
+# None means "use config.CHROMA_PATH" (read at call time, so --store and
+# OMEN_HOME apply). Tests set this to a temporary directory.
+CHROMA_PATH: Path | None = None
+
+
+def _chroma_path() -> Path:
+    return Path(CHROMA_PATH) if CHROMA_PATH else config.CHROMA_PATH
 
 
 def _embed(prompts: list[str]) -> list[list[float]]:
@@ -36,10 +45,17 @@ def _embed(prompts: list[str]) -> list[list[float]]:
         return []
     body = json.dumps({"model": EMBED_MODEL, "input": prompts}).encode()
     req = urllib.request.Request(
-        _EMBED_URL, data=body, headers={"Content-Type": "application/json"}
+        f"{config.OLLAMA_HOST}/api/embed", data=body, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # Ollama answers 404 for a model that is not pulled
+            raise errors.ModelMissing(EMBED_MODEL) from e
+        raise
+    except urllib.error.URLError as e:
+        raise errors.OllamaUnavailable() from e
     return data["embeddings"]
 
 
@@ -58,9 +74,10 @@ def embed_document(texts: list[str], title: str = "none") -> list[list[float]]:
 
 
 def get_client() -> chromadb.ClientAPI:
-    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+    path = _chroma_path()
+    path.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(
-        path=str(CHROMA_PATH),
+        path=str(path),
         settings=Settings(anonymized_telemetry=False),
     )
 
@@ -86,17 +103,8 @@ def _variants(incident: Incident) -> list[tuple[str, str, str]]:
     return out
 
 
-def reindex(incidents: list[Incident]) -> int:
-    """Rebuild the Chroma collection from SQLite. Deterministic ids mean
-    re-seeding upserts rather than duplicating. Returns the number of
-    variants indexed."""
-    client = get_client()
-    try:
-        client.delete_collection(CHROMA_COLLECTION)
-    except Exception:
-        pass  # first run: collection doesn't exist yet
-    col = get_collection(client)
-
+def _records(incidents: list[Incident]) -> tuple[list[str], list[str], list[dict]]:
+    """(ids, texts, metadatas) for every variant of `incidents`."""
     ids: list[str] = []
     texts: list[str] = []
     metadatas: list[dict] = []
@@ -113,13 +121,50 @@ def reindex(incidents: list[Incident]) -> int:
                     "severity": incident.severity or "",
                 }
             )
+    return ids, texts, metadatas
 
+
+def reindex(incidents: list[Incident]) -> int:
+    """Rebuild the Chroma collection from SQLite (`omen reindex`, and
+    `omen doctor --fix`). Returns the number of variants indexed."""
+    client = get_client()
+    try:
+        client.delete_collection(CHROMA_COLLECTION)
+    except Exception:
+        pass  # first run: collection doesn't exist yet
+    col = get_collection(client)
+
+    ids, texts, metadatas = _records(incidents)
     if not ids:
         return 0
 
     embeddings = embed_query(texts)
     col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
     return len(ids)
+
+
+def reindex_incident(incident: Incident) -> int:
+    """Re-embed ONE incident's variants (audit B26): delete its variants by
+    `incident_ref`, upsert the new ones. Used by `write_incident` and
+    `omen memory revert`; the rest of the collection is untouched, so a
+    write costs one incident's embeddings, not the whole ledger's. The
+    embedding happens first, so a failed embed leaves the old variants in
+    place. Returns the number of variants indexed."""
+    ids, texts, metadatas = _records([incident])
+    embeddings = embed_query(texts)
+    col = get_collection()
+    col.delete(where={"incident_ref": incident.ref})
+    col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    return len(ids)
+
+
+def indexed_documents() -> dict[str, str]:
+    """{variant id: document} for everything in the collection, without
+    creating a store that does not exist (`omen doctor` is read-only)."""
+    if not _chroma_path().exists():
+        return {}
+    got = get_collection().get(include=["documents"])
+    return dict(zip(got["ids"], got["documents"]))
 
 
 def count() -> int:
@@ -130,16 +175,27 @@ def delete_incident_variants(ref: str) -> None:
     get_collection().delete(where={"incident_ref": ref})
 
 
+def query_chunks(embeddings: list[list[float]], n_results: int = 6) -> list[list[dict]]:
+    """Query with many chunk embeddings in ONE Chroma call (production plan
+    Phase 5: one query for a whole scan, not one per chunk). Returns, per
+    embedding and in order, hits with `similarity` already converted from
+    Chroma's raw cosine distance (PLAN.md: "convert once at the vectors.py
+    boundary so no threshold logic downstream sees a raw distance") —
+    callers never see `distance`."""
+    if not embeddings:
+        return []
+    res = get_collection().query(query_embeddings=embeddings, n_results=n_results)
+    all_hits = []
+    for ids, dists, metas, docs in zip(res["ids"], res["distances"], res["metadatas"], res["documents"]):
+        all_hits.append(
+            [
+                {"id": id_, "similarity": 1.0 - dist, "metadata": meta, "document": doc}
+                for id_, dist, meta, doc in zip(ids, dists, metas, docs)
+            ]
+        )
+    return all_hits
+
+
 def query_chunk(embedding: list[float], n_results: int = 6) -> list[dict]:
-    """Query with a chunk embedding. Returns hits with `similarity` already
-    converted from Chroma's raw cosine distance (PLAN.md: "convert once at
-    the vectors.py boundary so no threshold logic downstream sees a raw
-    distance") — callers never see `distance`."""
-    col = get_collection()
-    res = col.query(query_embeddings=[embedding], n_results=n_results)
-    hits = []
-    for id_, dist, meta, doc in zip(
-        res["ids"][0], res["distances"][0], res["metadatas"][0], res["documents"][0]
-    ):
-        hits.append({"id": id_, "similarity": 1.0 - dist, "metadata": meta, "document": doc})
-    return hits
+    """Query with one chunk embedding (see `query_chunks`)."""
+    return query_chunks([embedding], n_results=n_results)[0]

@@ -4,42 +4,37 @@ grep -ri redis demo_repo/ returns nothing and the scan still flags the
 right chunk." Includes the negative control: the hard negative
 (cache/response_cache.py) must never come back confirmed.
 
-Live Ollama required (skips gracefully without it) — this drives the full
-Scout -> Librarian -> Triage -> Investigator -> Adjudicator pipeline
-against the real `demo_repo/`, against an isolated store seeded from the
-real `incidents.yaml` (never the live on-disk ledger/Chroma index).
+The scan test is marked `live` (needs Ollama; it is skipped one test at a
+time when Ollama is unreachable) and drives the full Scout -> Librarian ->
+Triage -> Investigator -> Adjudicator pipeline against the real `demo_repo/`,
+against an isolated store seeded from the real `incidents.yaml` (never the
+live on-disk ledger/Chroma index). The Redis check needs no model and runs
+everywhere, CI included.
 """
 import argparse
-import subprocess
-import urllib.request
 from pathlib import Path
 
 import pytest
 
-from omen import cli, config, store, vectors
+from omen import cli, store, vectors
 
 DEMO_REPO = Path(__file__).resolve().parent.parent / "demo_repo"
 INCIDENTS_YAML = Path(__file__).resolve().parent.parent / "incidents.yaml"
 
 
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
 def test_no_redis_anywhere_in_demo_repo():
     """PLAN.md: "grep -ri redis demo_repo/ returns nothing" — the true
-    positive shares OMEN-001's mechanism with no shared vocabulary."""
-    result = subprocess.run(
-        ["grep", "-ril", "redis", str(DEMO_REPO)], capture_output=True, text=True
-    )
-    assert result.stdout.strip() == "", f"unexpected Redis mention(s): {result.stdout}"
+    positive shares OMEN-001's mechanism with no shared vocabulary.
 
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
+    The same check as `grep -ril redis` (every file, any case, binary files
+    included), in Python so it does not depend on `grep` being on PATH
+    (it is not on every Windows machine or CI runner)."""
+    hits = [
+        str(path.relative_to(DEMO_REPO))
+        for path in sorted(DEMO_REPO.rglob("*"))
+        if path.is_file() and b"redis" in path.read_bytes().lower()
+    ]
+    assert hits == [], f"unexpected Redis mention(s): {hits}"
 
 
 @pytest.fixture
@@ -54,13 +49,17 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 def _scan_args() -> argparse.Namespace:
-    # --all: demo_repo's working tree has no uncommitted diff (everything
-    # is committed), so the default `git diff` scope would scan nothing.
+    # --all: scan every file. The default scope is the uncommitted diff,
+    # and a clean checkout of demo_repo has none, so it would scan nothing.
+    # (In a clone demo_repo is part of the OUTER repository; its own nested
+    # history comes from scripts/build_demo_repo.py and is not needed here.)
     return argparse.Namespace(
         path=str(DEMO_REPO), since=None, all=True, dry_run=False, retrieval_only=False, runner="adk"
     )
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_scan_confirms_permissions_and_rejects_response_cache(isolated_store):
     await cli.cmd_scan(_scan_args())

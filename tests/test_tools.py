@@ -5,20 +5,11 @@ need Ollama, and those skip gracefully without it.
 """
 import subprocess
 import time
-import urllib.request
 
 import pytest
 
-from omen import config, store, tools, vectors
+from omen import store, tools, vectors
 from omen.tools import PathEscapesRoot, ToolBudget
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def _git(repo, *args) -> None:
@@ -209,7 +200,10 @@ def test_write_incident_updates_when_given_existing_ref(tmp_path, monkeypatch):
     )
     assert same_ref == ref
     incident = store.get_incident(conn, ref)
-    assert incident.title == "Updated title"
+    # Since Phase 4 (audit B8) an update MERGES: curated text is kept, the new
+    # surface form is added (details in tests/test_memory_integrity.py).
+    assert incident.title == "Original title"
+    assert incident.surface_forms == ["form", "form2"]
     assert len(store.list_incidents(conn)) == 1  # updated in place, not duplicated
 
 
@@ -218,7 +212,7 @@ def test_write_incident_updates_when_given_existing_ref(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
+@pytest.mark.live
 def test_search_memory_and_get_incident(tmp_path, monkeypatch):
     from omen.contracts import Incident
 
@@ -306,6 +300,7 @@ def test_budget_trips_wall_clock_ceiling():
         return "ok"
 
     budget = ToolBudget(max_calls=6, wall_clock_seconds=0.05)
+    assert budget.invoke({"fake_tool": fake_tool}, "fake_tool", {})[0] is True  # starts the clock (B5)
     time.sleep(0.1)
     ok, result, note = budget.invoke({"fake_tool": fake_tool}, "fake_tool", {})
     assert ok is False
@@ -320,7 +315,11 @@ def test_budget_catches_tool_exceptions_and_caches_the_error():
     ok, result, note = budget.invoke({"raises": raises}, "raises", {"x": 1})
     assert ok is True  # the call itself completed; the *tool* failed, not the budget
     assert "boom" in result
-    assert note is None
+    assert note == "error"  # B10: marked, so it is never mistaken for a real result
+
+    ok, cached, note = budget.invoke({"raises": raises}, "raises", {"x": 1})
+    assert cached == result
+    assert "repeat" in note
 
 
 def test_budget_converts_path_escape_to_error_string(tmp_path):
@@ -361,3 +360,165 @@ def test_learn_git_tools_has_exactly_four_tools(tmp_path):
     conn = store.connect(tmp_path / "test.db")
     learn_tools = tools.build_learn_git_tools(conn, tmp_path, source="git:x")
     assert set(learn_tools) == {"read_commit", "read_diff", "search_memory", "write_incident"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 regressions (docs/PRODUCTION_PLAN.md; bug IDs from the audit's
+# Appendix B). Each test reproduced its bug before the fix.
+# ---------------------------------------------------------------------------
+
+
+def _commit_one_file(repo) -> str:
+    _init_repo(repo)
+    (repo / "a.py").write_text("def f():\n    return 1\n")
+    _git(repo, "add", "a.py")
+    _git(repo, "commit", "-qm", "initial")
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_b3_read_commit_rejects_option_injection_and_writes_no_file(tmp_path):
+    """B3: a model-chosen `sha` of `--output=<path>` used to reach
+    `git show` as an option and write an arbitrary file on the host."""
+    repo = tmp_path / "repo"
+    _commit_one_file(repo)
+    target = tmp_path / "written_by_model.txt"
+
+    result = tools._make_read_commit(repo)(f"--output={target}")
+
+    assert result.startswith("error")
+    assert not target.exists()
+
+
+def test_b3_read_diff_rejects_option_injection_and_writes_no_file(tmp_path):
+    repo = tmp_path / "repo"
+    _commit_one_file(repo)
+    target = tmp_path / "written_by_model.txt"
+
+    result = tools._make_read_diff(repo)(f"--output={target}", "a.py")
+
+    assert result.startswith("error")
+    assert not target.exists()
+
+
+def test_b3_read_commit_still_accepts_full_and_abbreviated_shas(tmp_path):
+    repo = tmp_path / "repo"
+    sha = _commit_one_file(repo)
+    read_commit = tools._make_read_commit(repo)
+    assert sha in read_commit(sha)
+    assert sha in read_commit(sha[:8])
+    assert "+def f():" in tools._make_read_diff(repo)(sha[:8], "a.py")
+
+
+def test_b4_read_file_refuses_secrets_store_and_git_inside_its_root(tmp_path):
+    """B4: the Archivist's read_file must never return `.env`, a SQLite
+    database, anything under `omen_store/`, or anything under `.git/`,
+    even when those sit inside the allowed root."""
+    (tmp_path / ".env").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / ".env.local").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / "omen_store").mkdir()
+    (tmp_path / "omen_store" / "notes.txt").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / "omen_store" / "omen.db").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / "other.db").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("FAKE_SECRET=do-not-leak\n")
+    (tmp_path / "postmortem.md").write_text("# fine to read\n")
+
+    read_file = tools._make_read_file(tmp_path)
+    budget = ToolBudget(max_calls=20, wall_clock_seconds=90)
+    for path in [".env", ".env.local", "omen_store/notes.txt", "omen_store/omen.db", "other.db", ".git/config"]:
+        ok, result, _ = budget.invoke({"read_file": read_file}, "read_file", {"file_path": path})
+        assert ok
+        assert "FAKE_SECRET" not in result, path
+        assert result.startswith("error"), path
+
+    assert read_file("postmortem.md") == "# fine to read\n"
+
+
+def test_b5_wall_clock_starts_at_the_first_tool_call():
+    """B5: a slow first model turn (before any tool call) used to use up
+    the whole wall-clock budget, so the first tool call was refused."""
+    budget = ToolBudget(max_calls=6, wall_clock_seconds=0.05)
+    time.sleep(0.1)  # stands in for a slow first LLM turn on CPU
+    ok, result, note = budget.invoke({"fake_tool": lambda: "ok"}, "fake_tool", {})
+    assert ok is True
+    assert result == "ok"
+    assert note is None
+
+
+def _isolated_write_incident(tmp_path, monkeypatch, learned_by="archivist:postmortem"):
+    monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(vectors, "embed_query", lambda texts: [[1.0] for _ in texts])
+    conn = store.connect(tmp_path / "test.db")
+    return conn, tools._make_write_incident(conn, learned_by=learned_by, source="test")
+
+
+_INCIDENT_FIELDS = dict(
+    title="t", failure_mechanism="m", what_happened="h", the_rule="r", surface_forms=["f"]
+)
+
+
+@pytest.mark.parametrize("bad_ref", ["not-a-ref", "OMEN-7", "omen-001", "OMEN-001; DROP TABLE incidents", "OMEN-042"])
+def test_b9_write_incident_rejects_malformed_or_unknown_existing_ref(tmp_path, monkeypatch, bad_ref):
+    """B9: any `existing_ref` string used to become a new ref. It must
+    match the ref format AND name an incident that exists."""
+    conn, write_incident = _isolated_write_incident(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        write_incident(**_INCIDENT_FIELDS, existing_ref=bad_ref)
+    assert store.list_incidents(conn) == []
+
+
+def test_b10_tool_exception_is_marked_with_an_error_note():
+    def raises(x):
+        raise ValueError("boom")
+
+    budget = ToolBudget(max_calls=6, wall_clock_seconds=90)
+    ok, result, note = budget.invoke({"raises": raises}, "raises", {"x": 1})
+    assert ok is True
+    assert "boom" in result
+    assert note == "error"
+
+
+def test_b10_written_ref_ignores_a_failed_write_incident(tmp_path, monkeypatch):
+    """B10: a write_incident that raised used to be recorded with
+    note=None, so `written_ref` reported "error: ..." as the new ref."""
+    import sqlite3
+
+    from omen import archivist
+    from omen.contracts import Transcript
+
+    conn, write_incident = _isolated_write_incident(tmp_path, monkeypatch)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "upsert_incident", locked)
+    wrapped, steps = tools.budgeted_tools({"write_incident": write_incident}, ToolBudget())
+    wrapped[0](**_INCIDENT_FIELDS)
+
+    assert steps[0].result.startswith("error")
+    assert archivist.written_ref(Transcript(steps=steps, final_text="", stopped_reason="model_finished")) is None
+
+
+def test_b11_ref_is_not_reused_after_forgetting_the_newest(tmp_path, monkeypatch):
+    conn, write_incident = _isolated_write_incident(tmp_path, monkeypatch)
+    first = write_incident(**_INCIDENT_FIELDS)
+    second = write_incident(**_INCIDENT_FIELDS)
+    assert (first, second) == ("OMEN-001", "OMEN-002")
+
+    assert store.forget_incident(conn, second)
+    assert write_incident(**_INCIDENT_FIELDS) == "OMEN-003"
+
+
+def test_b11_ref_is_not_reused_after_forgetting_a_seeded_incident(tmp_path, monkeypatch):
+    """Seeded refs are set explicitly (incidents.yaml), not allocated by
+    _next_ref, so forgetting the newest seeded incident must also retire
+    its number."""
+    from omen.contracts import IncidentSeed
+
+    conn, write_incident = _isolated_write_incident(tmp_path, monkeypatch)
+    for n in (1, 2, 3):
+        store.upsert_incident(conn, IncidentSeed(ref=f"OMEN-00{n}", **_INCIDENT_FIELDS))
+    assert store.forget_incident(conn, "OMEN-003")
+    assert write_incident(**_INCIDENT_FIELDS) == "OMEN-004"

@@ -12,11 +12,10 @@
 Live Ollama required (skips gracefully without it).
 """
 import subprocess
-import urllib.request
 
 import pytest
 
-from omen import archivist, config, runners, store, vectors
+from omen import archivist, runners, store, vectors
 
 BEFORE_CODE = (
     "import functools\n\n"
@@ -78,17 +77,6 @@ def _build_fix_commit(repo) -> str:
     return _rev_parse_head(repo)
 
 
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
-
-
 @pytest.fixture(autouse=True)
 def isolated_chroma(tmp_path, monkeypatch):
     # Same hazard as tests/test_archivist.py: write_incident's reindex()
@@ -107,6 +95,8 @@ def _has_negation_near_invalidation(mechanism: str) -> bool:
     return any(n in lower for n in negation_words) and any(c in lower for c in concept_words)
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_archivist_records_pre_change_failure_not_the_fix(tmp_path):
     repo = tmp_path / "repo"
@@ -133,6 +123,8 @@ async def test_archivist_records_pre_change_failure_not_the_fix(tmp_path):
     assert "cache_clear()" not in mechanism
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_archivist_git_dedups_on_second_run(tmp_path):
     repo = tmp_path / "repo"

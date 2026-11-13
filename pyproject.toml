@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omen"
+version = "0.1.0"
+description = "Local incident memory: learn failure mechanisms from postmortems and git history, then scan code for them with Gemma via Ollama."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+# Exact pins, same as requirements.txt (the lock-style list). google-genai
+# is imported directly by omen/agents.py, so it is pinned here explicitly
+# instead of arriving only as a google-adk dependency (audit B24).
+dependencies = [
+    "google-adk==2.5.0",
+    "google-genai==2.34.0",
+    "litellm==1.94.0",
+    "chromadb==1.5.9",
+    "pydantic==2.13.4",
+    "ollama==0.6.2",
+    "pyyaml==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.4",
+]
+
+[project.scripts]
+omen = "omen.cli:entrypoint"
+
+[tool.setuptools]
+packages = ["omen", "omen.prompts"]
+
+[tool.setuptools.package-data]
+"omen.prompts" = ["*.txt"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+extend-exclude = ["demo_repo", "omen_store"]
+
+[tool.ruff.lint]
+# Ruff's default rule set (pyflakes + the pycodestyle error subset). No
+# formatter or import sorting: either would reorder or rewrap code, and
+# Phase 2 allows lint fixes only where behaviour cannot change.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.coverage.run]
+source = ["omen"]

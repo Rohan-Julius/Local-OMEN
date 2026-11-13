@@ -101,3 +101,35 @@ def test_select_candidates_ignores_unrelated_history(tmp_path):
 
     candidates = sifter.select_candidates(tmp_path, "HEAD", max_commits=50)
     assert candidates == []
+
+
+# ---------------------------------------------------------------------------
+# B30: git output must be read as UTF-8 and paths unquoted (like Scout, B29)
+# ---------------------------------------------------------------------------
+
+# "Ł" is UTF-8 C5 81 and "Ý" is C3 9D: 0x81 and 0x9D are undefined in cp1252,
+# so decoding this subject with the Windows locale encoding fails outright.
+UTF8_SUBJECT = "fix: Łódź café cache returned Ýears-old data"
+
+
+def test_b30_commit_subject_with_utf8_bytes_is_read_exactly(tmp_path):
+    _init_repo(tmp_path)
+    _commit(tmp_path, "README.md", "hello\n", "initial commit")
+    sha = _commit(tmp_path, "notes.txt", "x\n", UTF8_SUBJECT)
+
+    candidates = sifter.select_candidates(tmp_path, "HEAD~1..HEAD", max_commits=50)
+
+    assert [(c.sha, c.subject, c.reason) for c in candidates] == [(sha, UTF8_SUBJECT, "message:fix")]
+
+
+def test_b30_non_ascii_path_in_a_sensitive_directory(tmp_path):
+    """The path-signal commit must be selected, and the Sifter must see the
+    real path, not git's quoted form (`"na\303\257ve_auth/..."`)."""
+    _init_repo(tmp_path)
+    _commit(tmp_path, "README.md", "hello\n", "initial commit")
+    sha = _commit(tmp_path, "naïve_auth/permissões.py", "ALLOW = True\n", "tidy up module layout")
+
+    candidates = sifter.select_candidates(tmp_path, "HEAD~1..HEAD", max_commits=50)
+
+    assert [(c.sha, c.reason) for c in candidates] == [(sha, "path:auth")]
+    assert sifter._changed_paths(tmp_path, sha) == ["naïve_auth/permissões.py"]

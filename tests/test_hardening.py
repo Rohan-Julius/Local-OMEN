@@ -8,28 +8,20 @@ automate and expensive to discover live on the demo machine.
   (PLAN.md Verification: "Graceful degradation... empty ledger... clear
   messages, no tracebacks").
 
-Nothing here needs a live Ollama connection for the agent-construction
-check; the empty-ledger scan still embeds real code chunks, so it skips
-gracefully without Ollama, same as the rest of the live-model suite.
+Nothing here needs a live Ollama connection: agent construction makes no
+call, and an empty-ledger scan stops before embedding anything. None of
+these tests is marked `live`, so they run in the unit tier and in CI (since
+Phase 0 the old module-level skip, audit B19, no longer hides them).
 """
 from __future__ import annotations
 
 import argparse
 import socket
-import urllib.request
 
 import pytest
 
-from omen import agents, cli, config, store, vectors
+from omen import agents, cli, store, vectors
 from omen.contracts import TriageVerdict
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 def test_adk_agent_construction_touches_no_socket(monkeypatch):
@@ -54,9 +46,6 @@ def test_adk_agent_construction_touches_no_socket(monkeypatch):
     assert agent.name == "structured_role"
 
 
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
-
-
 @pytest.fixture
 def isolated_store(tmp_path, monkeypatch):
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
@@ -68,7 +57,16 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scan_against_empty_ledger_gates_nothing_without_crashing(tmp_path, isolated_store):
+async def test_scan_against_empty_ledger_stops_with_a_clear_message(tmp_path, isolated_store, monkeypatch, capsys):
+    """Since Phase 3 (production plan, carry-over A): an empty ledger stops
+    the scan with a clear message and exit code 1, before any embedding,
+    instead of embedding the code and recording an empty run. No model
+    or embedding call is made, so this no longer needs Ollama."""
+
+    def no_embedding(prompts):
+        raise AssertionError("scan embedded code against an empty ledger")
+
+    monkeypatch.setattr(vectors, "_embed", no_embedding)
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "app.py").write_text(
@@ -81,12 +79,10 @@ async def test_scan_against_empty_ledger_gates_nothing_without_crashing(tmp_path
     args = argparse.Namespace(
         path=str(repo), since=None, all=True, dry_run=False, retrieval_only=False, runner="adk"
     )
-    await cli.cmd_scan(args)  # must not raise
+    assert await cli.cmd_scan(args) == cli.EXIT_USER_ERROR  # must not raise
 
-    runs = isolated_store.execute("SELECT * FROM runs").fetchall()
-    assert len(runs) == 1
-    assert runs[0]["n_gated"] == 0
-    assert runs[0]["n_confirmed"] == 0
-
-    findings = isolated_store.execute("SELECT * FROM findings").fetchall()
-    assert findings == []
+    out = capsys.readouterr().out
+    assert "ledger is empty" in out
+    assert "Traceback" not in out
+    assert isolated_store.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert isolated_store.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 0

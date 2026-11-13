@@ -1,5 +1,7 @@
 # Omen
 
+[![CI](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml/badge.svg?branch=production-hardening)](https://github.com/mohamed-faizal007/Local-OMEN/actions/workflows/ci.yml)
+
 > Turn a team's own incident history into a standing set of code reviewers — an agent that
 > learns the *mechanism* behind a past failure (from a postmortem, or straight from `git`
 > history) and later explains, with cited evidence, why a new chunk of code repeats it. Runs
@@ -32,10 +34,14 @@ multi-stage judging pipeline free to run per call.
 - [Commands](#commands)
 - [Data model](#data-model)
 - [Configuration](#configuration)
+- [CPU and GPU profiles](#cpu-and-gpu-profiles)
+- [Outputs and exit codes](#outputs-and-exit-codes)
 - [Tech stack](#tech-stack)
 - [Testing](#testing)
 - [Project structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
 - [Documentation](#documentation)
+- [License](#license)
 
 ## Features
 
@@ -53,9 +59,10 @@ multi-stage judging pipeline free to run per call.
   *pre-change* state — a fix commit shows the remedy being added, not the bug that made it
   necessary.
 - **Dedup before write.** Every write checks the ledger for a near-duplicate first
-  (`search_memory`) and updates that entry instead of creating a redundant one.
+  (`search_memory`) and merges into that entry instead of creating a redundant one: existing surface forms are kept, new ones added.
 - **A real undo.** `omen memory forget <ref>` removes an incident from both SQLite and the
-  vector index — the safety valve that makes autonomous memory writes acceptable.
+  vector index, and `omen memory revert <ref>` restores it (or undoes a merge) from the incident's
+  history — the safety valve that makes autonomous memory writes acceptable.
 
 ### Investigation (`omen scan`)
 
@@ -77,7 +84,8 @@ multi-stage judging pipeline free to run per call.
 
 ### Safeguards
 
-- **Nothing self-confirms.** A `confirmed` verdict with no cited evidence lines is
+- **Nothing self-confirms.** A `confirmed` verdict must cite `path:line` evidence the
+  Investigator actually saw, after at least one successful tool call; otherwise it is
   automatically downgraded to `unverified` in code, never left to the model's discretion.
 - **Bounded agent loops.** Max tool calls per chunk, a duplicate-call cache, and a wall-clock
   ceiling are enforced in the orchestrator — never merely requested in a prompt.
@@ -174,65 +182,73 @@ to ripple elsewhere:
 
 ## Quick start
 
-Prerequisites: Python 3.11, and [Ollama](https://ollama.com/) installed and running.
+Prerequisites: Python 3.11 or 3.12, and [Ollama](https://ollama.com/) installed and running.
 
 ```bash
-git clone <this-repo>
-cd Local-lore
+git clone <this-repo> Local-OMEN
+cd Local-OMEN
 
 py -3.11 -m venv .venv
 .venv\Scripts\activate            # Windows; use `source .venv/bin/activate` on macOS/Linux
-pip install -r requirements.txt
+pip install -e .                  # gives an `omen` command that works from any directory
+                                  # (use ".[dev]" for the tests and linter)
 
 ollama pull gemma4:12b-it-q4_K_M
 ollama pull embeddinggemma
 ```
 
+`omen <command>` is equivalent to `omen <command>`; the examples below use `omen`.
+On Windows, install into a short path (see [Troubleshooting](#troubleshooting)). Check the
+setup with `omen doctor`.
+
 If you're on a GPU-constrained card, model loading matters: Ollama can silently split the model
 across CPU/GPU and tank throughput unless it's told to keep the whole model resident on GPU.
 `omen/config.py` is the one place model and runtime flags (`NUM_GPU`, `NUM_CTX`,
-`THINK_DEFAULT`) live — see [Configuration](#configuration).
+`THINK_DEFAULT`) live — see [Configuration](#configuration). On a CPU-only machine, see
+[CPU and GPU profiles](#cpu-and-gpu-profiles).
 
 ## Usage walkthrough
 
 1. **Bootstrap the ledger.** Load the starter incident set and build its vector index:
 
    ```bash
-   python -m omen.cli seed incidents.yaml
-   python -m omen.cli reindex
-   python -m omen.cli memory list
+   omen seed incidents.yaml
+   omen reindex
+   omen memory list
    ```
 
    You should see the seeded incidents printed with their refs (`OMEN-001`, `OMEN-002`, ...).
+   `omen memory show <ref>` prints one in full.
 
 2. **Teach it something new**, from a postmortem or from raw history:
 
    ```bash
-   python -m omen.cli learn postmortems/some-incident.md
-   python -m omen.cli learn --from-git HEAD~40..HEAD --dry-run   # preview candidates first
+   omen learn postmortems/some-incident.md
+   omen learn --from-git HEAD~40..HEAD --dry-run   # preview candidates first
    ```
 
 3. **Scan a codebase** against everything currently in memory:
 
    ```bash
-   python -m omen.cli scan path/to/a/repo
+   omen scan path/to/a/repo
    ```
 
    Defaults to diffing the working tree; pass a directory and `--all` to scan every tracked
    file instead. `--dry-run` stops after chunking, `--retrieval-only` stops after ranking
-   candidates — both skip every model call, useful as a fast sanity check.
+   candidates — both skip every model call, useful as a fast sanity check. `--format`,
+   `--output` and `--fail-on` are covered in [Outputs and exit codes](#outputs-and-exit-codes).
 
 4. **Undo a bad memory** if `learn` got something wrong:
 
    ```bash
-   python -m omen.cli memory forget OMEN-007
+   omen memory forget OMEN-007
+   omen memory revert OMEN-007      # changed your mind: restore it (or undo its last change)
    ```
 
 ### Try it on the bundled demo
 
-`demo_repo/` is a small, self-contained example service — its own nested git repo (only
-`demo_repo/.git/` is ignored by this repo; its *files* are tracked normally) — built to
-exercise both commands end to end:
+`demo_repo/` is a small, self-contained example service built to exercise both commands end
+to end:
 
 - **A planted true positive** (`permissions.py`): a `functools.lru_cache`'d permission check
   with no invalidation on revoke. It shares OMEN-001's failure mechanism with none of its
@@ -241,37 +257,49 @@ exercise both commands end to end:
   identifier, mechanically unrelated — it caches a static response body, nothing
   authorization-related.
 - **A small constructed commit history** — one real fix commit plus keyword-avoiding decoys —
-  for trying `--from-git` end to end.
+  for trying `--from-git` end to end. The history lives in a nested git repo that this
+  repository ignores (`demo_repo/.git/`), so a fresh clone has the files but not the history:
+  run `python scripts/build_demo_repo.py` once to rebuild it (it never touches an existing
+  `demo_repo/.git`).
 
 ```bash
-python -m omen.cli scan demo_repo --all
-python -m omen.cli learn --from-git HEAD --repo demo_repo --dry-run   # drop --dry-run to actually learn
+omen scan demo_repo --all
+omen learn --from-git HEAD --repo demo_repo --dry-run   # drop --dry-run to actually learn
 ```
 
 ## Commands
 
-All commands go through `python -m omen.cli <command>`.
+All commands go through `omen <command>` (or `python -m omen.cli <command>`). Every command accepts `--store DIR` (default `$OMEN_HOME`, else `./omen_store`), `--profile gpu|cpu|auto`, `-v` and `-q`.
 
 | Command | What it does |
 |---|---|
 | `omen seed <incidents.yaml>` | Loads a YAML file of incidents into the SQLite ledger. Used once to bootstrap a starter memory set. |
 | `omen reindex` | Rebuilds the Chroma vector index from SQLite. SQLite is always the source of truth; Chroma is a derived index you can throw away and rebuild any time. |
+| `omen doctor [--fix]` | Checks the store: does the index match the ledger, is Ollama reachable, are both models pulled, schema version. `--fix` rebuilds a drifted index. Exit 0 healthy, 1 problems. |
 | `omen memory list` | Lists every incident currently in the ledger, with its ref and how it was learned. |
-| `omen memory forget <ref>` | Deletes an incident from both SQLite and the vector index — the undo for a bad `omen learn` run. |
+| `omen memory show <ref>` | Shows one incident in full: mechanism, rule, surface forms, every source. |
+| `omen memory history <ref>` | Lists an incident's create/update/forget/revert history. |
+| `omen memory revert <ref> [--to N]` | Restores an incident from history: undoes its last change, or brings back a forgotten one. |
+| `omen memory forget <ref>` | Deletes an incident from both SQLite and the vector index — the undo for a bad `omen learn` run (its history is kept, so `revert` can restore it). |
 | `omen learn <postmortem.md>` | Reads a postmortem file and forms a new memory (or updates a near-duplicate one) from it. |
-| `omen learn --from-git <range>` | Reads raw commit history (e.g. `HEAD~40..HEAD`): the Sifter narrows the range to candidates, then each is turned into a memory. `--repo <path>` picks which repo to read (default: cwd); also takes `--max-commits`, `--max-learn`, `--dry-run`. |
-| `omen scan <path>` | Runs the full investigation pipeline and prints a verdict per flagged chunk. `--dry-run` stops after chunking; `--retrieval-only` stops after ranking candidates (no generation); `--since <rev>` diffs a specific ref; `--all` scans the whole tracked tree. |
-| `omen calibrate` | Sweeps the retrieval similarity threshold over a labeled fixture set and prints where true positives stop surviving and hard negatives start getting rejected. A tuning tool for `SIMILARITY_THRESHOLD`, not part of the normal learn/scan workflow. |
+| `omen learn --from-git <range>` | Reads raw commit history (e.g. `HEAD~40..HEAD`): the Sifter narrows the range to candidates, then each is turned into a memory. `--repo <path>` picks which repo to read (default: cwd); also takes `--max-commits`, `--max-learn`, `--dry-run`. `learn <postmortem>` also takes `--allow-dir`. |
+| `omen scan <path>` | Runs the full investigation pipeline and prints a verdict per flagged chunk. `--dry-run` stops after chunking; `--retrieval-only` stops after ranking candidates (no generation); `--since <rev>` diffs a specific ref; `--all` scans the whole tracked tree; `--max-gated N` / `--max-positives N` cap how many chunks are triaged / investigated; `--format`, `--output`, `--fail-on` choose the report (see [Outputs](#outputs-and-exit-codes)). |
+| `omen calibrate` | Sweeps the retrieval similarity threshold over a labeled fixture set and prints where true positives stop surviving and hard negatives start getting rejected. A tuning tool for `SIMILARITY_THRESHOLD`, not part of the normal learn/scan workflow; reads `fixtures/calibration.yaml` by default. |
+| `omen eval` | Measures retrieval, Triage and (with `--full`) the whole pipeline on the held-out `fixtures/heldout.yaml`, prints precision and recall, and writes `eval/results-<date>.json`. Also `--retrieval-only`, `--runner`, `--fixtures-path`. See [docs/EVALUATION.md](docs/EVALUATION.md). |
 
-`learn` and `scan` both also take `--runner={adk,direct}` — see
+`learn`, `scan` and `eval` also take `--runner={adk,direct}` — see
 [Two execution backends](#two-execution-backends).
 
-`learn` is the only command that writes to the ledger — every `write_incident` call
-immediately re-embeds and rebuilds the vector index, so a freshly learned incident is
+`learn` and `seed` write to the ledger — every `write_incident` call
+immediately re-embeds the changed incident in the vector index, so a freshly learned incident is
 retrievable by the very next `scan` with no manual `reindex` needed. `seed`/`reindex` bootstrap
-and repair that same ledger by hand; `memory list`/`forget` let you inspect and undo what's in
-there; `calibrate` is a standalone tuning loop against a fixture file, independent of the real
-ledger.
+and repair that same ledger by hand; `memory` lets you inspect and undo what's in
+there; `calibrate` and `eval` are measurement tools against fixture files and never change the ledger.
+
+`omen seed`, `calibrate` and `eval` read files you name, and `incidents.yaml` and `fixtures/` are
+not installed with the package. Run them from a clone, or pass explicit paths:
+`omen seed /path/to/incidents.yaml`, `omen calibrate --fixtures-path /path/to/calibration.yaml`,
+`omen eval --fixtures-path /path/to/heldout.yaml`.
 
 ## Data model
 
@@ -283,9 +311,11 @@ index, rebuildable at any time via `omen reindex` — nothing ever writes to it 
 | `incidents` | The abstracted `failure_mechanism`, `what_happened`, and `the_rule` for each learned incident, plus provenance (`source`, `learned_by`). |
 | `surface_forms` | Concrete manifestations of an incident's mechanism, embedded separately — the single biggest retrieval lever. |
 | `chunk_vectors` | A content-hash cache of computed chunk embeddings. Exact-key lookup only, never a similarity search. |
+| `incident_history` | Every create/update/forget/revert of an incident, so changes are undoable. |
 | `runs` | One row per `scan`/`learn` invocation: timing, counts, which runner. |
 | `findings` | One row per flagged chunk: verdict, mechanism, reasoning, evidence, similarity. |
 | `tool_calls` | The full audit trail of every tool call made during every investigation. |
+| `skipped_chunks` | Chunks a cap (`--max-gated`, `--max-positives`) kept from being processed — never silently dropped. |
 
 `learned_by` distinguishes a memory a human seeded (`seed`) from one the agent formed, and
 which input path formed it (`archivist:postmortem` vs. `archivist:git`); `source` carries the
@@ -310,12 +340,51 @@ and how the runtime talks to it.
 | `NUM_CTX` | `4096` | Fits fully on an 8GB card; `8192` does not. |
 | `TEMPERATURE` | `0` | Applied to every role — determinism, not just Triage. |
 | `THINK_DEFAULT` | `False` | Off for latency-sensitive structured roles (Triage, Adjudicator): Gemma 4's "thinking" mode costs ~8x latency for no observed quality gain on these prompts. |
-| `SIMILARITY_THRESHOLD` | `0.35` | The Librarian's retrieval floor, chosen by `omen calibrate` against `fixtures/fixtures.yaml`. |
+| `SIMILARITY_THRESHOLD` | `0.35` | The Librarian's retrieval floor, chosen by `omen calibrate` against `fixtures/calibration.yaml`. |
 | `MAX_TOOL_CALLS` / `TOOL_WALL_CLOCK_SECONDS` | `6` / `90` | Hard caps on an Investigator's tool loop, enforced in code. |
 | `MAX_COMMITS` / `MAX_LEARN` | `50` / `5` | Bounds on `omen learn --from-git`: how many commits the Sifter considers, and how many candidates the Archivist actually processes. |
 
-Adjust `LLM_MODEL`, `NUM_GPU`, and `NUM_CTX` here for different hardware — nothing elsewhere in
+`OLLAMA_HOST` (one address for every call), `OMEN_HOME` (store directory) and `OMEN_PROFILE` are read from the environment. Adjust `LLM_MODEL`, `NUM_GPU`, and `NUM_CTX` here for different hardware — nothing elsewhere in
 the codebase names a model or a GPU flag directly.
+
+## CPU and GPU profiles
+
+Omen picks time limits and `think` settings from a **hardware profile**:
+
+| | `gpu` | `cpu` |
+|---|---|---|
+| Typical structured call | about 7 s (RTX 5050) | 110 to 170 s (i7 laptop) |
+| One model generation may take | 120 s | 600 s |
+| One investigation may take | 90 s | 1800 s |
+| Investigator and Archivist `think` | on | off |
+
+Choose with `--profile gpu|cpu|auto` or `OMEN_PROFILE`. `auto` (the default) asks Ollama whether
+the model is on the GPU after a warm-up call, and assumes `gpu` if it cannot tell. **On a CPU-only
+machine pass `--profile cpu`.** Every command that uses the model first makes a throwaway warm-up
+call with one retry (the first call after an Ollama restart can crash the CUDA backend; skip it with
+`--no-warmup`). A CPU scan of the demo repo took about 28 minutes in the last measured run; GPU
+timings on this branch are still to be measured.
+
+## Outputs and exit codes
+
+`omen scan --format text|markdown|json|sarif [--output FILE] [--fail-on confirmed|unverified]`
+
+| Format | For |
+|---|---|
+| `text` (default) | A person at a terminal |
+| `markdown` | A pull-request comment or wiki page |
+| `json` | Scripts (entries are exactly the `Finding` model) |
+| `sarif` | GitHub code scanning and other SARIF 2.1.0 viewers |
+
+Except for `text`, stdout carries only the document and progress goes to stderr. A pre-commit hook
+(`omen-scan`) and an example CI workflow are in [docs/OUTPUTS.md](docs/OUTPUTS.md).
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success (with `--fail-on`: nothing at or above the level) |
+| 1 | User error: bad arguments, a missing file, an unknown ref, an empty ledger |
+| 2 | `--fail-on` found a finding at or above the level |
+| 3 | Runtime or model error: Ollama down, a model not pulled, a timeout |
 
 ## Tech stack
 
@@ -336,15 +405,17 @@ No paid API is required anywhere in the stack.
 ## Testing
 
 ```bash
-pytest                      # full suite (~5-6 min); most tests hit a live Ollama instance
-pytest tests/test_scout.py  # fast, no model required
-pytest tests/test_triage.py # the fixture precision/recall gate
+ruff check .
+pytest -m "not live"              # unit tier: no model needed, runs in CI
+pytest -m "live and not slow"     # quick live tier (needs Ollama)
+pytest -m live                    # full live tier
+pytest tests/test_triage.py       # the fixture precision/recall gate (live)
 ```
 
-Tests that require live inference are written that way deliberately — prompt quality for a
-system like this can't be meaningfully verified with mocks, so most of the suite exercises the
-real model rather than stubbing it out; those tests skip gracefully when Ollama isn't
-reachable.
+Prompt quality for a system like this can't be meaningfully verified with mocks, so the live
+tier exercises the real model; those tests skip gracefully when Ollama isn't reachable. The
+unit tier uses scripted fake runners and fake embedders. Detection quality is measured on a
+held-out fixture set that is never used for tuning: see [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## Project structure
 
@@ -362,19 +433,61 @@ omen/
 │   ├── scout.py        # git scope resolution + ast chunking
 │   ├── librarian.py    # embed (cached) + query + collapse + gate
 │   ├── sifter.py        # deterministic commit-range prefilter for --from-git
+│   ├── evidence.py      # checks that a `confirmed` verdict's evidence is real
+│   ├── render.py        # markdown / json / sarif reports
+│   ├── evaluation.py    # scoring for `omen eval`
+│   ├── profiles.py      # gpu / cpu limits
+│   ├── doctor.py        # `omen doctor`
 │   ├── archivist.py     # the learn mission
-│   ├── fixtures.py      # loads fixtures/fixtures.yaml for calibrate/tests
-│   └── report.py        # progress lines, terminal summary
-├── prompts/              # triage, investigator, adjudicator, archivist (per input path)
+│   ├── fixtures.py      # loads the fixture files for calibrate/eval/tests
+│   ├── report.py        # progress lines, terminal summary
+│   └── prompts/         # triage, investigator, adjudicator, archivist (per input path)
 ├── incidents.yaml        # the seeded starter ledger
 ├── postmortems/           # raw markdown for `omen learn` to consume
-├── fixtures/              # labeled chunks + expected verdicts, for calibrate/tests
+├── fixtures/              # calibration.yaml (tuning) and heldout.yaml (evaluation)
+├── docs/                  # plans, evaluation, outputs, reference
+├── scripts/               # build_demo_repo.py
 ├── demo_repo/             # self-contained example service used above
 └── tests/
 ```
 
+## Troubleshooting
+
+**Install fails on Windows with a "path too long" error** (typically on a data file inside
+`litellm`). Windows limits paths to 260 characters unless long paths are enabled. Create the
+virtual environment at a short path (for example `C:\omen\.venv`), or enable long paths
+(`LongPathsEnabled` = 1 under `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`, plus
+`git config --system core.longpaths true`) and install again.
+
+**`omen seed`, `calibrate` or `eval` says a file is not found.** They take explicit paths when run
+outside the checkout (see [Commands](#commands)). The default store is `./omen_store` in the
+*current* directory, so run from the same place each time or set `OMEN_HOME` / `--store`.
+
+**`omen doctor` reports drift** (missing, stale or extra index entries): `omen doctor --fix`
+rebuilds the index from the ledger (needs Ollama for the embeddings). Exit 0 healthy, 1 problems.
+
+**`error: Ollama is not reachable`** or **`model ... not found`** (exit 3): start `ollama serve`
+(or set `OLLAMA_HOST`), or run the `ollama pull` the message names.
+
+**Very slow, or "timed out".** You are probably on a CPU: use `--profile cpu` and consider
+`--max-gated` and `--max-positives`.
+
+**`error: the incident ledger is empty`** (exit 1): run `omen seed incidents.yaml`, then `omen reindex`.
+
+**"skipped N chunk(s) because of caps".** Chunks beyond `--max-gated`, or Triage positives beyond
+`--max-positives`, were not processed; they are listed and stored. Raise the caps to process them.
+
 ## Documentation
 
 - [PLAN.md](PLAN.md) — full design rationale, the original 8-hour build plan, and the track
-  alignment writeup.
+  alignment writeup (see its "As-built status" table for where the code differs).
+- [CHANGELOG.md](CHANGELOG.md) — what changed on the `production-hardening` branch, phase by phase.
+- [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md) — the hardening plan, progress log and pending live checks.
+- [docs/EVALUATION.md](docs/EVALUATION.md) — how detection quality is measured, and the results table.
+- [docs/OUTPUTS.md](docs/OUTPUTS.md) — report formats, exit codes, pre-commit, CI example.
+- [SECURITY.md](SECURITY.md) and [CONTRIBUTING.md](CONTRIBUTING.md) — threat model and reporting; test tiers, calibration rule, commit policy.
 - This README — commands, architecture, configuration, and how to run the project day to day.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

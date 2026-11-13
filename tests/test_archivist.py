@@ -7,11 +7,10 @@ Live Ollama required (skips gracefully without it) — same as the other
 agentic-role tests, there's no meaningful way to test prompt quality
 without actually running the model.
 """
-import urllib.request
 
 import pytest
 
-from omen import archivist, config, runners, store, vectors
+from omen import archivist, runners, store, vectors
 
 POSTMORTEM_TEXT = """# Postmortem: wrong user's data returned under load
 
@@ -38,17 +37,6 @@ bare module-level or global variable.
 """
 
 
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
-
-
 @pytest.fixture(autouse=True)
 def isolated_chroma(tmp_path, monkeypatch):
     """`write_incident` calls `vectors.reindex()`, which deletes and rebuilds
@@ -63,6 +51,8 @@ def isolated_chroma(tmp_path, monkeypatch):
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_archivist_abstracts_and_spans_technologies(tmp_path):
     (tmp_path / "postmortem.md").write_text(POSTMORTEM_TEXT, encoding="utf-8")
@@ -94,6 +84,8 @@ async def test_archivist_abstracts_and_spans_technologies(tmp_path):
     assert "python" not in mechanism_lower
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_archivist_dedups_on_second_run(tmp_path):
     (tmp_path / "postmortem.md").write_text(POSTMORTEM_TEXT, encoding="utf-8")
@@ -109,7 +101,6 @@ async def test_archivist_dedups_on_second_run(tmp_path):
     assert second_ref, f"second run never wrote/updated an incident: {second.final_text}"
 
     incidents = store.list_incidents(conn)
-    matching = [i for i in incidents if i.ref == first_ref or i.ref == second_ref]
     assert first_ref == second_ref, (
         f"second run created a new ref ({second_ref}) instead of updating the first ({first_ref})"
     )

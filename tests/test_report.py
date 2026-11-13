@@ -8,26 +8,19 @@ and tested directly, no model needed. The persistence wiring in
 Investigator/Adjudicator prompt *quality* is already covered live
 elsewhere (test_triage.py, test_runners.py, test_adjudicator.py); this
 file's job is only to prove the Scribe half — that `runs`, `findings`,
-and `tool_calls` actually get populated from one scan. The embedding
-step still hits live Ollama (cheap, no generation), so this skips
-gracefully without it.
+and `tool_calls` actually get populated from one scan. The embedding call
+is faked too (`_fake_embeddings`), so these tests need no Ollama and run
+in the unit tier and in CI (none of these tests is marked `live`; the
+module-level skip that used to hide them when Ollama was down, audit B19,
+was removed in Phase 0).
 """
 import argparse
 import time
-import urllib.request
 
 import pytest
 
-from omen import cli, config, report, runners, store, tools as tools_mod, vectors
+from omen import cli, report, runners, store, tools as tools_mod, vectors
 from omen.contracts import AdjudicatorVerdict, Finding, IncidentSeed, Transcript, TriageVerdict
-
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -44,14 +37,18 @@ def test_stopwatch_accumulates_across_laps():
     assert watch.total_ms >= 15  # two ~10ms laps, generous floor for CI jitter
 
 
-def test_scan_stats_as_run_fields_matches_runs_columns():
+def test_scan_stats_as_run_fields_matches_runs_columns(tmp_path):
     stats = report.ScanStats(n_files=2, n_chunks=5, n_gated=1, ms_embed=100)
     fields = stats.as_run_fields()
     expected_keys = {
         "n_files", "n_chunks", "n_cache_hits", "n_gated", "n_triaged", "n_investigated",
-        "n_tool_calls", "n_confirmed", "ms_embed", "ms_triage", "ms_investigate", "ms_total",
+        "n_tool_calls", "n_confirmed", "ms_scout", "ms_embed", "ms_triage", "ms_investigate",
+        "ms_adjudicate", "ms_total", "n_skipped",
     }
     assert set(fields) == expected_keys
+    # every field is a real `runs` column (after migrations), so finish_run cannot fail on it
+    columns = {r["name"] for r in store.connect(tmp_path / "t.db").execute("PRAGMA table_info(runs)")}
+    assert set(fields) <= columns
     assert fields["n_chunks"] == 5
     assert fields["ms_embed"] == 100
 
@@ -91,11 +88,6 @@ def test_print_summary_handles_no_findings(capsys):
 # ---------------------------------------------------------------------------
 
 
-pytestmark = pytest.mark.skipif(
-    not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST (needed for the embed step)"
-)
-
-
 class _FakeRunner:
     """Stands in for ADKRoleRunner/DirectOllamaRunner so this test proves
     the Scribe's persistence plumbing, not prompt quality (covered live
@@ -109,13 +101,14 @@ class _FakeRunner:
                 confidence="high",
                 reasoning="matches OMEN-001's stale-permission-cache mechanism",
             )
-        if schema is AdjudicatorVerdict:
-            return AdjudicatorVerdict(
+        if issubclass(schema, AdjudicatorVerdict):  # the per-call schema (B17)
+            return schema(
                 verdict="confirmed",
                 code_mechanism="caches a permission decision with no invalidation",
                 reasoning="matches OMEN-001",
                 evidence_lines=["permissions.py:3: no cache_clear call found anywhere in the file"],
                 confidence="high",
+                incident_ref="OMEN-001",
             )
         raise AssertionError(f"unexpected schema {schema}")
 
@@ -126,8 +119,19 @@ class _FakeRunner:
         return Transcript(steps=steps, final_text="checked for invalidation, found none", stopped_reason="model_finished")
 
 
+def _fake_embeddings(monkeypatch) -> None:
+    """Every text embeds to the same unit vector, so every chunk is a
+    perfect (similarity 1.0) match for every incident variant and clears
+    the retrieval gate. Retrieval quality is not what these tests check."""
+    monkeypatch.setattr(vectors, "_embed", lambda prompts: [[1.0, 0.0, 0.0] for _ in prompts])
+
+
 def _scan_args(path: str) -> argparse.Namespace:
-    return argparse.Namespace(path=path, since=None, all=False, dry_run=False, retrieval_only=False, runner="adk")
+    # no_warmup/profile: these tests use a fake runner, so no Ollama call (and no profile probe) may happen
+    return argparse.Namespace(
+        path=path, since=None, all=False, dry_run=False, retrieval_only=False, runner="adk",
+        no_warmup=True, profile="gpu", max_gated=8, max_positives=2,
+    )
 
 
 @pytest.mark.asyncio
@@ -142,6 +146,7 @@ async def test_cmd_scan_persists_run_findings_and_tool_calls(tmp_path, monkeypat
     )
 
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
+    _fake_embeddings(monkeypatch)
     real_connect = store.connect
     monkeypatch.setattr(store, "connect", lambda *a, **k: real_connect(tmp_path / "test.db"))
     monkeypatch.setattr(runners, "ADKRoleRunner", lambda: _FakeRunner())
@@ -197,6 +202,7 @@ async def test_cmd_scan_retrieval_only_does_not_persist_a_run(tmp_path, monkeypa
     )
 
     monkeypatch.setattr(vectors, "CHROMA_PATH", tmp_path / "chroma")
+    _fake_embeddings(monkeypatch)
     real_connect = store.connect
     monkeypatch.setattr(store, "connect", lambda *a, **k: real_connect(tmp_path / "test.db"))
 

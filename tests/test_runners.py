@@ -4,24 +4,13 @@ means something if both paths are actually exercised, not just one.
 
 Live Ollama required (skips gracefully without it).
 """
-import urllib.request
 
 import pytest
 
-from omen import agents, config, store, tools
+from omen import agents, store, tools
 from omen.contracts import TriageVerdict
 from omen.runners import ADKRoleRunner, DirectOllamaRunner
 
-
-def _ollama_reachable() -> bool:
-    try:
-        urllib.request.urlopen(config.OLLAMA_HOST, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _ollama_reachable(), reason="Ollama is not reachable on OLLAMA_HOST")
 
 RUNNERS = [ADKRoleRunner, DirectOllamaRunner]
 
@@ -56,6 +45,7 @@ OMEN-001: Stale permission cache after revocation
 """
 
 
+@pytest.mark.live
 @pytest.mark.parametrize("runner_cls", RUNNERS, ids=["adk", "direct"])
 @pytest.mark.asyncio
 async def test_run_structured_matches_true_positive(runner_cls):
@@ -65,6 +55,7 @@ async def test_run_structured_matches_true_positive(runner_cls):
     assert verdict.verdict == "MATCH"
 
 
+@pytest.mark.live
 @pytest.mark.parametrize("runner_cls", RUNNERS, ids=["adk", "direct"])
 @pytest.mark.asyncio
 async def test_run_structured_rejects_hard_negative(runner_cls):
@@ -73,6 +64,8 @@ async def test_run_structured_rejects_hard_negative(runner_cls):
     assert verdict.verdict == "NO_MATCH"
 
 
+@pytest.mark.live
+@pytest.mark.slow
 @pytest.mark.parametrize("runner_cls", RUNNERS, ids=["adk", "direct"])
 @pytest.mark.asyncio
 async def test_run_structured_is_deterministic_on_verdict_and_confidence(runner_cls):
@@ -84,6 +77,7 @@ async def test_run_structured_is_deterministic_on_verdict_and_confidence(runner_
     assert len(set(results)) == 1, f"verdict/confidence varied across runs: {results}"
 
 
+@pytest.mark.live
 @pytest.mark.parametrize("runner_cls", RUNNERS, ids=["adk", "direct"])
 @pytest.mark.asyncio
 async def test_run_tooled_produces_a_sensible_transcript(tmp_path, runner_cls):
@@ -108,14 +102,19 @@ async def test_run_tooled_produces_a_sensible_transcript(tmp_path, runner_cls):
     runner = runner_cls()
     transcript = await runner.run_tooled(INVESTIGATOR_INSTRUCTION, prompt, scan_tools, budget, think=False)
 
-    assert transcript.final_text != ""
-    assert transcript.stopped_reason == "model_finished"
-    assert len(transcript.steps) > 0
+    detail = (
+        f"stopped_reason={transcript.stopped_reason} note={transcript.note} "
+        f"events={budget.events} steps={[(s.tool_name, s.note) for s in transcript.steps]}"
+    )
+    assert transcript.final_text != "", detail
+    assert transcript.stopped_reason == "model_finished", detail
+    assert len(transcript.steps) > 0, detail
     # the model should actually have looked at the code, not just guessed
     tool_names_used = {s.tool_name for s in transcript.steps}
     assert tool_names_used & {"read_code", "grep_symbol", "get_incident", "search_memory"}
 
 
+@pytest.mark.live
 @pytest.mark.parametrize("runner_cls", RUNNERS, ids=["adk", "direct"])
 @pytest.mark.asyncio
 async def test_run_tooled_respects_a_tight_call_cap(tmp_path, runner_cls):

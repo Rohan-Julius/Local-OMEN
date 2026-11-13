@@ -1,6 +1,8 @@
 # Pinned in Phase 0 on the RTX 5050 (Windows, Python 3.11.9) — dev and
 # demo are the same machine, so there is only one set of versions to match.
 google-adk==2.5.0
+# Imported directly by omen/agents.py, so pinned explicitly (audit B24).
+google-genai==2.34.0
 litellm==1.94.0
 chromadb==1.5.9
 pydantic==2.13.4
@@ -8,3 +10,7 @@ ollama==0.6.2
 pyyaml==6.0.3
 pytest==9.1.1
 pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+ruff==0.17.4
+# pyproject.toml holds the same pins: runtime in [project] dependencies,
+# the last four in the [dev] extra (`pip install -e .[dev]`).

@@ -94,9 +94,10 @@ def run(
     """Full Librarian pass: embed (cached), query, collapse, gate. Returns
     only chunks that cleared the similarity floor, plus embed-cache stats."""
     embeddings, stats = embed_chunks(conn, chunks)
+    # One Chroma query for every chunk (production plan Phase 5).
+    all_hits = vectors.query_chunks([embeddings[c.content_hash] for c in chunks], n_results=QUERY_N_RESULTS)
     gated: list[GatedChunk] = []
-    for chunk in chunks:
-        hits = vectors.query_chunk(embeddings[chunk.content_hash], n_results=QUERY_N_RESULTS)
+    for chunk, hits in zip(chunks, all_hits):
         candidates = collapse_to_incidents(hits)
         gated_chunk = gate(chunk, candidates, threshold=threshold)
         if gated_chunk:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ from omen.contracts import Chunk
 
 CHUNK_LINE_CAP = 120
 CHUNK_OVERLAP = 10
+
+log = logging.getLogger(__name__)
 
 SKIP_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
 
@@ -30,10 +33,14 @@ class ScopeResult:
 
 
 def _run_git(repo_path: Path, args: list[str]) -> subprocess.CompletedProcess:
+    # git writes paths as UTF-8 whatever the console code page; decoding
+    # with the locale (cp1252 on Windows) would mangle non-ASCII names.
     return subprocess.run(
         ["git", "-C", str(repo_path), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -51,22 +58,23 @@ def _walk_py_files(repo_path: Path) -> list[Path]:
     return sorted(files)
 
 
+def _git_paths(repo_path: Path, args: list[str]) -> list[str]:
+    """Run a git command that lists paths, with `-z` output: NUL-separated
+    and never quoted. Without `-z` git quotes any path with non-ASCII
+    bytes (`"caf\303\251.py"`), which then failed the `.py` check and was
+    silently dropped (audit B29)."""
+    # -z right after the subcommand: after --end-of-options it would be read as a revision.
+    output = _run_git(repo_path, [args[0], "-z", *args[1:]]).stdout
+    return [p for p in output.split("\0") if p]
+
+
 def _git_tracked_py_files(repo_path: Path) -> list[Path]:
-    result = _run_git(repo_path, ["ls-files"])
-    files = []
-    for line in result.stdout.splitlines():
-        if line.endswith(".py"):
-            files.append(repo_path / line)
-    return files
+    return [repo_path / p for p in _git_paths(repo_path, ["ls-files"]) if p.endswith(".py")]
 
 
-def _git_diff_py_files(repo_path: Path, since: str | None) -> list[Path]:
-    args = ["diff", "--name-only"]
-    if since:
-        args.append(since)
-    result = _run_git(repo_path, args)
+def _existing_py_files(repo_path: Path, paths: list[str]) -> list[Path]:
     files = []
-    for line in result.stdout.splitlines():
+    for line in paths:
         if line.endswith(".py"):
             candidate = repo_path / line
             if candidate.exists():  # diff can list deleted files
@@ -74,28 +82,76 @@ def _git_diff_py_files(repo_path: Path, since: str | None) -> list[Path]:
     return files
 
 
+def _git_untracked_paths(repo_path: Path) -> list[str]:
+    """New files that are not ignored. `ls-files` run from a subdirectory
+    already prints paths relative to it."""
+    return _git_paths(repo_path, ["ls-files", "--others", "--exclude-standard"])
+
+
+def _union_py_files(repo_path: Path, path_lists: list[list[str]]) -> list[Path]:
+    seen: set[Path] = set()
+    for paths in path_lists:
+        seen.update(_existing_py_files(repo_path, paths))
+    return sorted(seen)
+
+
+def _git_since_py_files(repo_path: Path, since: str) -> list[Path]:
+    """`--since <rev>`: tracked files that differ between `rev` and the
+    working tree (staged or not), plus untracked files, de-duplicated.
+    Untracked files used to be left out. `--relative`, run from
+    `repo_path` (git -C), limits the diff to that directory and prints
+    paths relative to it; without it scanning a subdirectory found nothing
+    (audit B1)."""
+    return _union_py_files(
+        repo_path,
+        [
+            _git_paths(repo_path, ["diff", "--name-only", "--relative", "--end-of-options", since]),
+            _git_untracked_paths(repo_path),
+        ],
+    )
+
+
+def _git_working_changes_py_files(repo_path: Path) -> list[Path]:
+    """Default scope: everything not yet committed. That is unstaged
+    changes (`git diff`), staged changes (`git diff --cached`) and new
+    untracked files that are not ignored, de-duplicated and sorted. `git
+    diff` alone missed the last two (audit B2). `--cached` also works
+    before the first commit."""
+    return _union_py_files(
+        repo_path,
+        [
+            _git_paths(repo_path, ["diff", "--name-only", "--relative"]),
+            _git_paths(repo_path, ["diff", "--name-only", "--relative", "--cached"]),
+            _git_untracked_paths(repo_path),
+        ],
+    )
+
+
 def resolve_scope(repo_path: Path, since: str | None = None, all_files: bool = False) -> ScopeResult:
     """Resolve which files to scan.
 
-    Default: `git diff --name-only` (uncommitted changes). `--since <rev>`
-    diffs against a specific ref. `--all` walks the whole tracked tree.
-    A path that isn't a git repo falls back to a full filesystem walk, with
-    a printed notice — platform-agnostic, per PLAN.md's decision to keep
-    scope resolution local-git-only rather than depend on a host API.
+    Default: every uncommitted change, i.e. unstaged, staged and untracked
+    (not ignored) files. `--since <rev>` adds every tracked file that
+    differs from `rev`, plus untracked files. Both are limited to
+    `repo_path` when it is a subdirectory of a repo. `--all` walks the
+    whole tracked tree. A path that isn't a git repo falls back to a full
+    filesystem walk, with a logged warning — platform-agnostic, per
+    PLAN.md's decision to keep scope resolution local-git-only rather than
+    depend on a host API.
     """
     repo_path = Path(repo_path).resolve()
 
     if not _is_git_repo(repo_path):
-        print(f"warning: {repo_path} is not a git repository - falling back to a full tree scan")
+        log.warning("%s is not a git repository - falling back to a full tree scan", repo_path)
         return ScopeResult(files=_walk_py_files(repo_path), scope="full-tree (non-git fallback)")
 
     if all_files:
         return ScopeResult(files=_git_tracked_py_files(repo_path), scope="all")
 
     if since:
-        return ScopeResult(files=_git_diff_py_files(repo_path, since), scope=f"since:{since}")
+        return ScopeResult(files=_git_since_py_files(repo_path, since), scope=f"since:{since}")
 
-    return ScopeResult(files=_git_diff_py_files(repo_path, None), scope="diff")
+    return ScopeResult(files=_git_working_changes_py_files(repo_path), scope="diff")
 
 
 # ---------------------------------------------------------------------------

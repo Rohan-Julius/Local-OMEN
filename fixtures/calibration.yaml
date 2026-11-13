@@ -1,4 +1,7 @@
-# Phase 4 calibration set: 12 labeled chunks (PLAN.md).
+# Calibration set: 12 labeled chunks (PLAN.md Phase 4). Used for TUNING (the
+# similarity threshold, `omen calibrate`) and as the retrieval regression gate.
+# Never report results on this file as an evaluation: the held-out set is
+# fixtures/heldout.yaml (production plan Phase 6).
 #
 # true_match: should retrieve `target_ref` above the chosen similarity
 # floor. hard_negative: superficially similar vocabulary to a real
